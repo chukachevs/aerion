@@ -86,7 +86,7 @@ For more information, check the [Installation Section](https://aerion.3df.io/doc
 ### 📖 Documentation
 ---
 
-- [Official Documentation](https://aerion.3df.io/docs/)
+- [Official Documentation](https://aerion.3df.io/docs/intro)
 
 
 ### ⚗️ Tech Stack
