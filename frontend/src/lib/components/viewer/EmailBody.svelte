@@ -1,0 +1,420 @@
+<script lang="ts">
+  import Icon from '@iconify/svelte'
+  import { BrowserOpenURL } from '../../../../wailsjs/runtime/runtime'
+  import { GetInlineAttachments, IsImageAllowed, AddImageAllowlist } from '../../../../wailsjs/go/app/App'
+  import { getCached, setCache } from '../../stores/inlineAttachmentCache'
+  import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
+
+  interface Props {
+    messageId: string
+    accountId?: string
+    bodyHtml?: string
+    bodyText?: string
+    fromEmail?: string
+    onCompose?: (to: string) => void
+  }
+
+  let { messageId, accountId, bodyHtml = '', bodyText = '', fromEmail = '', onCompose }: Props = $props()
+
+  // State for remote image handling
+  let imagesBlocked = $state(true)
+  let iframeElement = $state<HTMLIFrameElement | null>(null)
+  let iframeReady = $state(false)
+  
+  // Inline attachment state
+  let inlineAttachments = $state<Record<string, string>>({})
+  let lastSentMessageId = $state<string | null>(null)
+  
+  // Derived state
+  let hasRemoteImages = $derived(checkForRemoteImages(bodyHtml))
+  let hasCidReferences = $derived(bodyHtml ? /src=["']cid:([^"']+)["']/i.test(bodyHtml) : false)
+
+  // Loading placeholder SVG
+  const loadingPlaceholder = `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='80' viewBox='0 0 120 80'%3E%3Crect fill='%23f3f4f6' width='120' height='80' rx='4'/%3E%3Cg transform='translate(60,40)'%3E%3Ccircle cx='0' cy='0' r='12' fill='none' stroke='%239ca3af' stroke-width='2' stroke-dasharray='20 10'%3E%3CanimateTransform attributeName='transform' type='rotate' from='0' to='360' dur='1s' repeatCount='indefinite'/%3E%3C/circle%3E%3C/g%3E%3Ctext x='60' y='65' text-anchor='middle' fill='%239ca3af' font-size='9' font-family='sans-serif'%3ELoading...%3C/text%3E%3C/svg%3E`
+
+  function checkForRemoteImages(html: string): boolean {
+    if (!html) return false
+    const remoteImagePattern = /<img[^>]+src=["'](https?:\/\/[^"']+)["']/gi
+    return remoteImagePattern.test(html)
+  }
+
+  function processCidReferences(html: string): string {
+    if (!html) return html
+    return html.replace(
+      /src=["']cid:([^"']+)["']/gi,
+      (match, contentId) => `src="${loadingPlaceholder}" data-cid="${contentId}"`
+    )
+  }
+
+  function processHtml(html: string, blockImages: boolean): string {
+    if (!html) return ''
+    let processed = processCidReferences(html)
+    if (blockImages) {
+      processed = processed.replace(
+        /(<img[^>]+)src=["'](https?:\/\/[^"']+)["']([^>]*>)/gi,
+        (match, before, src, after) => {
+          const placeholder = `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='60' viewBox='0 0 100 60'%3E%3Crect fill='%23e5e7eb' width='100' height='60'/%3E%3Ctext x='50' y='35' text-anchor='middle' fill='%239ca3af' font-size='10' font-family='sans-serif'%3EImage blocked%3C/text%3E%3C/svg%3E`
+          return `${before}src="${placeholder}" data-blocked-src="${encodeURIComponent(src)}"${after}`
+        }
+      )
+    }
+    return processed
+  }
+
+  function buildIframeContent(html: string): string {
+    const processedHtml = processHtml(html, imagesBlocked)
+    const imgSrc = imagesBlocked ? "'self' data:" : "* data:"
+    
+    const iframeScript = `
+      function sendHeight() {
+        var height = document.body.scrollHeight;
+        window.parent.postMessage({ type: 'iframe-height', height: height }, '*');
+      }
+      
+      function attachImageHandlers() {
+        document.querySelectorAll('img').forEach(function(img) {
+          if (!img.dataset.heightHandlerAttached) {
+            img.dataset.heightHandlerAttached = 'true';
+            img.onload = sendHeight;
+            img.onerror = sendHeight;
+          }
+        });
+      }
+      
+      window.addEventListener('message', function(e) {
+        if (e.data?.type === 'inline-images' && e.data.images) {
+          console.log('[iframe] Received inline images:', Object.keys(e.data.images));
+          var images = e.data.images;
+          var replaced = 0;
+          Object.keys(images).forEach(function(cid) {
+            var img = document.querySelector('img[data-cid="' + cid + '"]');
+            console.log('[iframe] Looking for cid:', cid, 'found:', !!img);
+            if (img) {
+              img.src = images[cid];
+              img.removeAttribute('data-cid');
+              replaced++;
+            }
+          });
+          console.log('[iframe] Replaced', replaced, 'images');
+          if (replaced > 0) {
+            attachImageHandlers();
+            setTimeout(sendHeight, 50);
+            setTimeout(sendHeight, 150);
+            setTimeout(sendHeight, 300);
+          }
+        }
+      });
+      
+      window.addEventListener('load', function() {
+        attachImageHandlers();
+        sendHeight();
+        console.log('[iframe] Sending ready signal');
+        window.parent.postMessage({ type: 'iframe-ready' }, '*');
+      });
+      
+      window.addEventListener('resize', sendHeight);
+      new ResizeObserver(sendHeight).observe(document.body);
+      setTimeout(sendHeight, 50);
+      setTimeout(sendHeight, 200);
+      
+      document.addEventListener('click', function(e) {
+        var link = e.target.closest('a');
+        if (link && link.href) {
+          e.preventDefault();
+          window.parent.postMessage({ type: 'open-link', url: link.href }, '*');
+        }
+      });
+    `
+    
+    return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; img-src ${imgSrc}; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <style>
+    /* Minimal base styles - avoid overriding email's inline styles */
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      font-family: system-ui, sans-serif;
+      font-size: 14px; line-height: 1.5;
+      color: #1a1a0a; background-color: white;
+      overflow-x: hidden; word-wrap: break-word;
+    }
+    body { padding: 16px; }
+    img { max-width: 100%; height: auto; }
+    img[data-cid] { min-width: 100px; min-height: 60px; }
+    a { color: #2563eb; }
+    /* Only apply defaults to elements without inline styles */
+    blockquote:not([style]) { margin: 0.5em 0; padding-left: 1em; border-left: 3px solid #e5e7eb; color: #6b7280; }
+    pre:not([style]) { background: #f3f4f6; padding: 0.5em; border-radius: 4px; overflow-x: auto; }
+    /* Remove table/td defaults that conflict with email layouts */
+  </style>
+</head>
+<body>
+${processedHtml}
+<scr` + `ipt>${iframeScript}</scr` + `ipt>
+</body>
+</html>`
+  }
+
+  function handleIframeMessage(event: MessageEvent) {
+    if (event.data?.type === 'iframe-height' && iframeElement) {
+      iframeElement.style.height = `${event.data.height + 20}px`
+    } else if (event.data?.type === 'iframe-ready') {
+      console.log('[EmailBody] Iframe ready')
+      iframeReady = true
+    } else if (event.data?.type === 'open-link') {
+      const url = event.data.url as string
+      if (url.startsWith('mailto:')) {
+        // Handle mailto: links by opening composer
+        const emailAddress = url.replace('mailto:', '').split('?')[0]
+        if (onCompose) {
+          onCompose(emailAddress)
+        } else {
+          // Fallback to system handler if no compose callback
+          BrowserOpenURL(url)
+        }
+      } else {
+        // Open external links in system browser
+        BrowserOpenURL(url)
+      }
+    }
+  }
+
+  function sendInlineImagesToIframe(images: Record<string, string>) {
+    if (iframeElement?.contentWindow && Object.keys(images).length > 0) {
+      console.log('[EmailBody] Sending images to iframe:', Object.keys(images))
+      // Use spread operator to create plain object from Svelte 5 $state proxy
+      // This is needed because postMessage uses structured clone which can't handle proxies
+      iframeElement.contentWindow.postMessage({
+        type: 'inline-images',
+        images: { ...images }
+      }, '*')
+    }
+  }
+
+  function loadImages() {
+    imagesBlocked = false
+  }
+
+  // Extract domain from email address
+  function extractDomain(email: string): string {
+    const parts = email.split('@')
+    return parts.length === 2 ? parts[1] : ''
+  }
+
+  // Handle "Always load for this sender" action
+  async function handleAlwaysLoadSender() {
+    if (!fromEmail) return
+    try {
+      await AddImageAllowlist('sender', fromEmail)
+      loadImages()
+    } catch (err) {
+      console.error('[EmailBody] Failed to add sender to allowlist:', err)
+    }
+  }
+
+  // Handle "Always load for this domain" action
+  async function handleAlwaysLoadDomain() {
+    const domain = extractDomain(fromEmail)
+    if (!domain) return
+    try {
+      await AddImageAllowlist('domain', domain)
+      loadImages()
+    } catch (err) {
+      console.error('[EmailBody] Failed to add domain to allowlist:', err)
+    }
+  }
+
+  // Check allowlist on mount and auto-load if sender/domain is allowed
+  $effect(() => {
+    const email = fromEmail
+    const hasImages = hasRemoteImages
+
+    if (email && hasImages) {
+      IsImageAllowed(email).then((allowed) => {
+        if (allowed) {
+          imagesBlocked = false
+        }
+      }).catch((err) => {
+        console.error('[EmailBody] Failed to check allowlist:', err)
+      })
+    }
+  })
+
+  // Reset state when messageId changes
+  $effect(() => {
+    const id = messageId
+    console.log('[EmailBody] Message changed to:', id)
+    iframeReady = false
+    lastSentMessageId = null
+    inlineAttachments = {}
+  })
+
+  // Fetch inline attachments when we have cid references
+  $effect(() => {
+    const id = messageId
+    const html = bodyHtml
+    const hasCid = html ? /src=["']cid:([^"']+)["']/i.test(html) : false
+    
+    console.log('[EmailBody] Fetch check:', { id, hasCid, htmlLen: html?.length })
+    
+    if (!id || !hasCid) {
+      return
+    }
+    
+    // Check memory cache first
+    const cached = getCached(id)
+    if (cached && Object.keys(cached).length > 0) {
+      console.log('[EmailBody] Cache hit:', Object.keys(cached))
+      inlineAttachments = cached
+      return
+    }
+    
+    console.log('[EmailBody] Fetching from backend...')
+    GetInlineAttachments(id)
+      .then((result: Record<string, string>) => {
+        const data = result || {}
+        console.log('[EmailBody] Received:', Object.keys(data))
+        inlineAttachments = data
+        if (Object.keys(data).length > 0) {
+          setCache(id, data)
+        }
+      })
+      .catch((err: Error) => {
+        console.error('[EmailBody] Fetch error:', err)
+      })
+  })
+
+  // Build iframe content
+  $effect(() => {
+    const html = bodyHtml
+    const blocked = imagesBlocked
+    
+    if (iframeElement && html) {
+      console.log('[EmailBody] Building iframe content')
+      const content = buildIframeContent(html)
+      iframeElement.srcdoc = content
+      iframeReady = false
+      lastSentMessageId = null
+    }
+  })
+
+  // Send inline images when ready
+  $effect(() => {
+    const ready = iframeReady
+    const images = inlineAttachments
+    const id = messageId
+    const alreadySent = lastSentMessageId === id
+    
+    console.log('[EmailBody] Send check:', { ready, imageCount: Object.keys(images).length, alreadySent })
+    
+    if (ready && Object.keys(images).length > 0 && !alreadySent) {
+      sendInlineImagesToIframe(images)
+      lastSentMessageId = id
+    }
+  })
+
+  // Message listener
+  $effect(() => {
+    window.addEventListener('message', handleIframeMessage)
+    return () => window.removeEventListener('message', handleIframeMessage)
+  })
+
+  // State for controlling the Always Load dropdown
+  let alwaysLoadDropdownOpen = $state(false)
+
+  // Listen for Ctrl-L load images event
+  $effect(() => {
+    function handleLoadImagesEvent() {
+      if (hasRemoteImages && imagesBlocked) {
+        loadImages()
+      }
+    }
+    window.addEventListener('load-remote-images', handleLoadImagesEvent)
+    return () => window.removeEventListener('load-remote-images', handleLoadImagesEvent)
+  })
+
+  // Listen for Ctrl-Shift-L always load dropdown event
+  $effect(() => {
+    function handleAlwaysLoadDropdownEvent() {
+      if (hasRemoteImages && imagesBlocked && fromEmail) {
+        alwaysLoadDropdownOpen = true
+      }
+    }
+    window.addEventListener('open-always-load-dropdown', handleAlwaysLoadDropdownEvent)
+    return () => window.removeEventListener('open-always-load-dropdown', handleAlwaysLoadDropdownEvent)
+  })
+
+  function linkifyText(text: string): string {
+    if (!text) return ''
+    const urlPattern = /(https?:\/\/[^\s<>"{}|\\^`\[\]]+)/g
+    const emailPattern = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g
+    let escaped = text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+    escaped = escaped.replace(urlPattern, '<a href="$1" target="_blank" rel="noopener noreferrer" class="text-primary hover:underline">$1</a>')
+    escaped = escaped.replace(emailPattern, '<a href="mailto:$1" class="text-primary hover:underline">$1</a>')
+    return escaped
+  }
+</script>
+
+<div class="email-body">
+  {#if bodyHtml}
+    {#if hasRemoteImages && imagesBlocked}
+      <div class="flex items-center gap-2 px-3 py-2 mb-3 rounded-md bg-yellow-500/10 border border-yellow-500/30 text-sm">
+        <Icon icon="mdi:image-off" class="w-4 h-4 text-yellow-600 flex-shrink-0" />
+        <span class="text-yellow-700 dark:text-yellow-400">Remote images are blocked for privacy.</span>
+
+        <div class="ml-auto flex items-center gap-1">
+          <!-- Load Images button -->
+          <button
+            class="px-2 py-1 text-xs font-medium rounded bg-yellow-600 text-white hover:bg-yellow-700 transition-colors"
+            onclick={loadImages}
+          >
+            Load Images
+          </button>
+
+          <!-- Always Load dropdown -->
+          {#if fromEmail}
+            <DropdownMenu.Root bind:open={alwaysLoadDropdownOpen}>
+              <DropdownMenu.Trigger
+                class="px-2 py-1 text-xs font-medium rounded bg-yellow-600 text-white hover:bg-yellow-700 transition-colors flex items-center gap-1"
+              >
+                Always Load
+                <Icon icon="mdi:chevron-down" class="w-3 h-3" />
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Content align="end">
+                <DropdownMenu.Item onSelect={handleAlwaysLoadDomain}>
+                  <Icon icon="mdi:domain" class="w-4 h-4 mr-2" />
+                  For {extractDomain(fromEmail) || 'this domain'}
+                </DropdownMenu.Item>
+                <DropdownMenu.Item onSelect={handleAlwaysLoadSender}>
+                  <Icon icon="mdi:account" class="w-4 h-4 mr-2" />
+                  For {fromEmail}
+                </DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Root>
+          {/if}
+        </div>
+      </div>
+    {/if}
+    
+    <iframe
+      bind:this={iframeElement}
+      title="Email content"
+      sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+      class="w-full border-0 rounded-md bg-white min-h-[100px]"
+      style="height: 200px;"
+    ></iframe>
+  {:else if bodyText}
+    <div class="whitespace-pre-wrap font-sans text-sm text-foreground bg-muted/30 rounded-md p-4">
+      {@html linkifyText(bodyText)}
+    </div>
+  {:else}
+    <p class="text-muted-foreground italic">No content available</p>
+  {/if}
+</div>

@@ -1,0 +1,1201 @@
+<script lang="ts">
+  import { onMount, onDestroy, getContext } from 'svelte'
+  import Icon from '@iconify/svelte'
+  import type { Editor } from '@tiptap/core'
+  import { createComposerEditor } from './composerEditor'
+  // @ts-ignore - Wails generated imports
+  import { smtp, account, contact } from '../../../../wailsjs/go/models'
+  // @ts-ignore - Wails runtime for events
+  import { EventsOn, EventsOff } from '../../../../wailsjs/runtime/runtime.js'
+  import { type ComposerApi, COMPOSER_API_KEY, createMainWindowApi } from '$lib/composerApi'
+  
+  // Attachment type from backend
+  interface ComposerAttachment {
+    filename: string
+    contentType: string
+    size: number
+    data: string // base64 encoded
+  }
+  
+  // Inline image type - for images pasted/dropped into the editor
+  interface InlineImage {
+    cid: string  // Content-ID (e.g., "image1@aerion")
+    dataUrl: string  // Full data URL for display in editor
+    contentType: string
+    data: string  // Base64 data only (without data URL prefix)
+    filename: string
+  }
+  import RecipientInput from './RecipientInput.svelte'
+  import EditorToolbar from './EditorToolbar.svelte'
+  import ComposerAttachmentList from './ComposerAttachmentList.svelte'
+  import {
+    base64ToBytes,
+    htmlToPlainText,
+    plainTextToHtml,
+    readFileAsBase64,
+    readFileAsDataUrl,
+    textMentionsAttachment,
+  } from './composerUtils'
+  import {
+    SIGNATURE_MARKER,
+    buildSignatureHtml,
+    shouldAppendSignature,
+    insertSignatureIntoContent,
+    removeSignatureFromContent,
+    hasSignatureMarker,
+    type ComposeMode,
+  } from './composerSignature'
+  import * as Select from '$lib/components/ui/select'
+  import * as AlertDialog from '$lib/components/ui/alert-dialog'
+  import { ConfirmDialog, ThreeOptionDialog } from '$lib/components/ui/confirm-dialog'
+  import { addToast } from '$lib/stores/toast'
+
+  // Props
+  interface Props {
+    accountId: string
+    /** Pre-populated message from backend (for reply/forward), or null for new message */
+    initialMessage?: smtp.ComposeMessage | null
+    /** Existing draft ID if editing a draft */
+    draftId?: string | null
+    /** Original message ID for reply/forward (needed for pop-out) */
+    messageId?: string | null
+    onClose?: () => void
+    onSent?: () => void
+    /** Optional API override - if not provided, uses context or creates main window API */
+    api?: ComposerApi
+    /** Whether this composer is in a detached window (hides pop-out button) */
+    isDetached?: boolean
+    /** Signal from parent (detached window) to trigger close flow */
+    closeRequested?: boolean
+    /** Callback when close request has been handled */
+    onCloseHandled?: () => void
+  }
+
+  let { accountId, initialMessage = null, draftId = null, messageId = null, onClose, onSent, api: propApi, isDetached = false, closeRequested = false, onCloseHandled }: Props = $props()
+
+  // Get API from context, props, or create default main window API
+  const contextApi = getContext<ComposerApi | undefined>(COMPOSER_API_KEY)
+  const defaultApi = createMainWindowApi()
+  // Use $derived so propApi changes are detected (even though it typically doesn't change after mount)
+  const api: ComposerApi = $derived(propApi || contextApi || defaultApi)
+
+  // State
+  let identities = $state<account.Identity[]>([])
+  let selectedIdentityId = $state<string>('')
+  let toRecipients = $state<smtp.Address[]>([])
+  let ccRecipients = $state<smtp.Address[]>([])
+  let bccRecipients = $state<smtp.Address[]>([])
+  let subject = $state('')
+  let showCc = $state(false)
+  let showBcc = $state(false)
+  let sending = $state(false)
+  let poppingOut = $state(false)  // Pop-out in progress
+  let editorElement = $state<HTMLElement | null>(null)
+  let editor = $state<Editor | null>(null)
+  
+  // Track In-Reply-To and References for threading
+  let inReplyTo = $state<string | undefined>(undefined)
+  let references = $state<string[]>([])
+  
+  // Attachments
+  let attachments = $state<ComposerAttachment[]>([])
+  let isDraggingOver = $state(false)
+  
+  // Inline images (embedded in HTML body)
+  let inlineImages = $state<InlineImage[]>([])
+  let inlineImageCounter = 0  // Counter for generating unique CIDs
+  
+  // Read receipt request
+  let requestReadReceipt = $state(false)
+  let showReadReceiptOption = $state(false)  // Show checkbox when policy is 'ask'
+  
+  // Plain text mode toggle
+  let isPlainTextMode = $state(false)
+  let plainTextContent = $state('')  // Store plain text when in plain text mode
+
+  // Toolbar ref for Alt+T focus
+  let toolbarRef = $state<{ focus: () => void } | null>(null)
+
+  // Draft auto-save state
+  let currentDraftId = $state<string | null>(null)
+  let saveStatus = $state<'idle' | 'saving' | 'saved' | 'error'>('idle')
+
+  // Initialize currentDraftId from prop (runs once on mount)
+  $effect(() => {
+    if (draftId && !currentDraftId) {
+      currentDraftId = draftId
+    }
+  })
+  let syncStatus = $state<'pending' | 'synced' | 'failed'>('pending') // IMAP sync status
+  let lastSavedAt = $state<Date | null>(null)
+  let saveTimeoutId: ReturnType<typeof setTimeout> | null = null
+  let lastContent = ''  // Track content changes to avoid unnecessary saves
+  
+  // 10-second debounce like Geary
+  const DRAFT_SAVE_DELAY = 10000
+  
+  // Confirmation dialogs state
+  let showEmptySubjectDialog = $state(false)
+  let showMissingAttachmentDialog = $state(false)
+  let showCloseConfirm = $state(false)
+  let closeLoading = $state<'discard' | 'save' | null>(null)
+  
+  // Check if the email body contains keywords that suggest an attachment should be present
+  function bodyMentionsAttachment(): boolean {
+    const bodyText = isPlainTextMode ? plainTextContent : (editor?.getText() || '')
+    const combinedText = bodyText + ' ' + subject
+    return textMentionsAttachment(combinedText)
+  }
+
+  // Determine display mode from initialMessage
+  function getDisplayMode(): 'new' | 'reply' | 'reply-all' | 'forward' {
+    if (!initialMessage) return 'new'
+    if (initialMessage.subject?.startsWith('Fwd:')) return 'forward'
+    if (initialMessage.in_reply_to) {
+      // reply-all if there are multiple To recipients or any Cc
+      if ((initialMessage.to?.length || 0) > 1 || (initialMessage.cc?.length || 0) > 0) {
+        return 'reply-all'
+      }
+      return 'reply'
+    }
+    return 'new'
+  }
+
+  // Check if the composer has any meaningful content worth saving
+  function hasContent(): boolean {
+    const bodyText = isPlainTextMode ? plainTextContent.trim() : (editor?.getText()?.trim() || '')
+    return toRecipients.length > 0 || ccRecipients.length > 0 || bccRecipients.length > 0 ||
+           subject.trim() !== '' || bodyText !== '' || attachments.length > 0
+  }
+
+  // Convert HTML with data URLs to use CID references for inline images
+  function convertDataUrlsToCid(html: string): string {
+    let result = html
+    
+    // For each inline image, replace its data URL with cid: reference
+    for (const img of inlineImages) {
+      // Escape special regex characters in the data URL
+      const escapedDataUrl = img.dataUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const regex = new RegExp(escapedDataUrl, 'g')
+      result = result.replace(regex, `cid:${img.cid}`)
+    }
+    
+    return result
+  }
+
+  // Build message object from current composer state
+  function buildMessage(): smtp.ComposeMessage {
+    const selectedIdentity = identities.find(i => i.id === selectedIdentityId)
+    
+    // Handle plain text vs rich text mode
+    let htmlContent: string
+    let textContent: string
+    
+    if (isPlainTextMode) {
+      // In plain text mode, we only have plain text
+      textContent = plainTextContent
+      htmlContent = ''  // No HTML version when composing in plain text
+    } else {
+      // In rich text mode, we have both
+      // Convert data URLs to CID references for inline images
+      htmlContent = convertDataUrlsToCid(editor?.getHTML() || '')
+      textContent = editor?.getText() || ''
+    }
+
+    // Convert ComposerAttachment to smtp.Attachment format (regular attachments)
+    const smtpAttachments: smtp.Attachment[] = attachments.map(att => new smtp.Attachment({
+      filename: att.filename,
+      content_type: att.contentType,
+      content: base64ToBytes(att.data),
+      content_id: '',
+      inline: false,
+    }))
+    
+    // Add inline images as inline attachments with Content-ID
+    for (const img of inlineImages) {
+      smtpAttachments.push(new smtp.Attachment({
+        filename: img.filename,
+        content_type: img.contentType,
+        content: base64ToBytes(img.data),
+        content_id: img.cid,
+        inline: true,
+      }))
+    }
+
+    return new smtp.ComposeMessage({
+      from: new smtp.Address({
+        name: selectedIdentity?.name || '',
+        address: selectedIdentity?.email || '',
+      }),
+      to: toRecipients,
+      cc: ccRecipients,
+      bcc: bccRecipients,
+      subject: subject,
+      html_body: htmlContent,
+      text_body: textContent,
+      attachments: smtpAttachments,
+      in_reply_to: inReplyTo,
+      references: references,
+      request_read_receipt: requestReadReceipt,
+    })
+  }
+  
+  // Get a content hash to detect meaningful changes
+  function getContentHash(): string {
+    const bodyContent = isPlainTextMode ? plainTextContent : (editor?.getHTML() || '')
+    const attachmentNames = attachments.map(a => a.filename).join(',')
+    return `${toRecipients.length}|${ccRecipients.length}|${bccRecipients.length}|${subject}|${bodyContent}|${attachmentNames}|${isPlainTextMode}`
+  }
+
+  // Schedule a draft save (debounced)
+  // Note: All expensive operations (hasContent, getContentHash) are inside the timeout
+  // to avoid lag on every keystroke
+  function scheduleDraftSave() {
+    // Clear any pending save
+    if (saveTimeoutId) {
+      clearTimeout(saveTimeoutId)
+    }
+
+    saveTimeoutId = setTimeout(async () => {
+      // Only save if there's content
+      if (!hasContent()) {
+        return
+      }
+
+      // Check if content actually changed
+      const currentHash = getContentHash()
+      if (currentHash === lastContent) {
+        return
+      }
+
+      // Content changed - reset status indicators
+      saveStatus = 'idle'
+      syncStatus = 'pending'
+
+      await saveDraft()
+    }, DRAFT_SAVE_DELAY)
+  }
+
+  // Actually save the draft
+  async function saveDraft() {
+    if (!hasContent()) return
+    
+    // Check again for content changes before saving
+    const currentHash = getContentHash()
+    if (currentHash === lastContent && currentDraftId) {
+      return  // No changes since last save
+    }
+
+    saveStatus = 'saving'
+    try {
+      const message = buildMessage()
+      const result = await api.saveDraft(accountId, message, currentDraftId || '')
+      currentDraftId = result.id
+      lastContent = currentHash
+      saveStatus = 'saved'
+      syncStatus = result.syncStatus as 'pending' | 'synced' | 'failed'
+      lastSavedAt = new Date()
+    } catch (err) {
+      console.error('Failed to save draft:', err)
+      saveStatus = 'error'
+    }
+  }
+
+  // Delete the current draft
+  async function deleteDraft() {
+    if (!currentDraftId) return
+
+    try {
+      await api.deleteDraft(currentDraftId)
+      currentDraftId = null
+    } catch (err) {
+      console.error('Failed to delete draft:', err)
+    }
+  }
+
+  // Watch for content changes and trigger auto-save
+  $effect(() => {
+    // Dependencies to watch
+    const _ = [toRecipients, ccRecipients, bccRecipients, subject]
+    scheduleDraftSave()
+  })
+
+  // Watch for close request from parent (detached window)
+  $effect(() => {
+    if (closeRequested) {
+      handleClose()
+    }
+  })
+
+  // Track current signature for swapping when identity changes
+  let currentSignatureHtml = $state<string>('')
+
+  // Initialize
+  onMount(async () => {
+    // Load identities for the account
+    try {
+      identities = await api.getIdentities(accountId)
+      
+      // Select identity: match reply recipient or use default
+      const matchedIdentity = selectIdentityForReply()
+      const selectedIdentity = matchedIdentity || identities.find(i => i.isDefault) || identities[0]
+      if (selectedIdentity) {
+        selectedIdentityId = selectedIdentity.id
+      }
+    } catch (err) {
+      console.error('Failed to load identities:', err)
+    }
+    
+    // Load account's read receipt request policy
+    try {
+      const acc = await api.getAccount(accountId)
+      const policy = acc.readReceiptRequestPolicy || 'never'
+      if (policy === 'always') {
+        requestReadReceipt = true
+        showReadReceiptOption = false  // Don't show checkbox, always enabled
+      } else if (policy === 'ask') {
+        requestReadReceipt = false  // Default unchecked
+        showReadReceiptOption = true  // Show checkbox
+      } else {
+        requestReadReceipt = false
+        showReadReceiptOption = false  // Don't show checkbox, never request
+      }
+    } catch (err) {
+      console.error('Failed to load account settings:', err)
+    }
+
+    // Initialize TipTap editor
+    if (editorElement) {
+      editor = createComposerEditor(editorElement, {
+        onUpdate: scheduleDraftSave,
+        onPasteImage: handleInlineImageFile,
+        onDropImage: handleInlineImageFile,
+      })
+    }
+
+    // Initialize from initialMessage if provided (reply/forward)
+    if (initialMessage) {
+      initializeFromMessage()
+      // Store initial content hash so we don't immediately save
+      lastContent = getContentHash()
+    }
+
+    // Append signature for the selected identity (after editor is ready)
+    // Only if signature doesn't already exist in content (e.g., from loaded draft)
+    setTimeout(() => {
+      const identity = identities.find(i => i.id === selectedIdentityId)
+      if (identity) {
+        const content = editor?.getHTML() || ''
+        // Don't append if signature marker already exists (draft already has signature)
+        if (!hasSignatureMarker(content)) {
+          appendSignatureForIdentity(identity)
+        }
+      }
+    }, 50)
+    
+    // Listen for draft sync status changes from backend
+    EventsOn('draft:syncStatusChanged', (data: { draftId: string, syncStatus: string, imapUid: number, error: string }) => {
+      if (data.draftId === currentDraftId) {
+        syncStatus = data.syncStatus as 'pending' | 'synced' | 'failed'
+      }
+    })
+    
+    // Focus editor at start after initialization (setTimeout ensures DOM is ready)
+    setTimeout(() => {
+      editor?.commands.focus('start')
+    }, 0)
+  })
+
+  // Select identity based on reply/forward recipient matching
+  function selectIdentityForReply(): account.Identity | null {
+    if (!initialMessage) return null
+    
+    // Get all recipient addresses from the original message
+    // Include To, Cc, AND Bcc - user may have been Bcc'd on the original
+    const recipientEmails = [
+      ...(initialMessage.to || []).map((a: any) => (a.address || a.email || '').toLowerCase()),
+      ...(initialMessage.cc || []).map((a: any) => (a.address || a.email || '').toLowerCase()),
+      ...(initialMessage.bcc || []).map((a: any) => (a.address || a.email || '').toLowerCase()),
+    ].filter(e => e)
+    
+    // Find an identity that matches one of the recipient addresses
+    return identities.find(identity => 
+      recipientEmails.includes(identity.email.toLowerCase())
+    ) || null
+  }
+
+  // Append signature for the current identity based on compose mode
+  function appendSignatureForIdentity(identity: account.Identity) {
+    if (!editor) return
+
+    const mode = getDisplayMode()
+    if (!shouldAppendSignature(identity, mode)) return
+
+    const signatureHtml = buildSignatureHtml(identity)
+    if (!signatureHtml) return
+
+    currentSignatureHtml = signatureHtml
+
+    const content = editor.getHTML()
+    const newContent = insertSignatureIntoContent(
+      content,
+      signatureHtml,
+      mode,
+      identity.signaturePlacement || 'above'
+    )
+
+    editor.commands.setContent(newContent)
+    editor.commands.focus('start')
+  }
+
+  // Handle identity change from the From dropdown
+  function handleIdentityChange(newIdentityId: string) {
+    if (newIdentityId === selectedIdentityId) return
+
+    const newIdentity = identities.find(i => i.id === newIdentityId)
+    selectedIdentityId = newIdentityId
+
+    if (!editor || !newIdentity) return
+
+    // Remove old signature and apply new one
+    const content = removeSignatureFromContent(editor.getHTML())
+    editor.commands.setContent(content)
+
+    appendSignatureForIdentity(newIdentity)
+    scheduleDraftSave()
+  }
+
+  onDestroy(() => {
+    // Unsubscribe from draft sync events
+    EventsOff('draft:syncStatusChanged')
+    // Clear any pending save timeout
+    if (saveTimeoutId) {
+      clearTimeout(saveTimeoutId)
+    }
+    editor?.destroy()
+  })
+
+  // Helper to ensure proper smtp.Address object (handles both 'address' and 'email' field names)
+  function toSmtpAddress(addr: any): smtp.Address {
+    if (!addr) return new smtp.Address({ name: '', address: '' })
+    return new smtp.Address({
+      name: addr.name || '',
+      address: addr.address || addr.email || ''
+    })
+  }
+
+  // Initialize composer fields from the pre-built message (from backend)
+  function initializeFromMessage() {
+    if (!initialMessage) return
+
+    // Set recipients - ensure proper smtp.Address objects
+    // The backend returns smtp.Address with 'address' field, but we need to handle
+    // any edge cases where plain objects come through
+    toRecipients = (initialMessage.to || []).map(toSmtpAddress)
+    ccRecipients = (initialMessage.cc || []).map(toSmtpAddress)
+    bccRecipients = (initialMessage.bcc || []).map(toSmtpAddress)
+    
+    // Show Cc field if there are Cc recipients
+    if (ccRecipients.length > 0) {
+      showCc = true
+    }
+
+    // Set subject
+    subject = initialMessage.subject || ''
+
+    // Set threading headers
+    inReplyTo = initialMessage.in_reply_to
+    references = initialMessage.references || []
+
+    // Set editor content
+    if (editor && initialMessage.html_body) {
+      editor.commands.setContent(initialMessage.html_body)
+      // Move cursor to beginning (before the quoted content)
+      editor.commands.focus('start')
+    }
+  }
+
+  // Pre-send validation - returns true if we should proceed, false if waiting for confirmation
+  function validateBeforeSend(): boolean {
+    // Check for missing attachment
+    if (attachments.length === 0 && bodyMentionsAttachment()) {
+      showMissingAttachmentDialog = true
+      return false
+    }
+    
+    // Check for empty subject
+    if (!subject.trim()) {
+      showEmptySubjectDialog = true
+      return false
+    }
+    
+    return true
+  }
+
+  async function handleSend() {
+    if (toRecipients.length === 0) {
+      addToast({
+        type: 'error',
+        message: 'Please add at least one recipient',
+      })
+      return
+    }
+
+    const selectedIdentity = identities.find(i => i.id === selectedIdentityId)
+    if (!selectedIdentity) {
+      addToast({
+        type: 'error',
+        message: 'Please select a sender identity',
+      })
+      return
+    }
+
+    // Run validations that may show confirmation dialogs
+    if (!validateBeforeSend()) {
+      return
+    }
+
+    await doSend()
+  }
+  
+  // Actually send the message (called directly or after confirmation)
+  async function doSend() {
+    // Cancel any pending draft save
+    if (saveTimeoutId) {
+      clearTimeout(saveTimeoutId)
+      saveTimeoutId = null
+    }
+
+    sending = true
+
+    try {
+      const message = buildMessage()
+      await api.sendMessage(accountId, message)
+
+      // Delete the draft on successful send (fire-and-forget - don't block UI)
+      if (currentDraftId) {
+        deleteDraft().catch(err => console.error('Failed to delete draft after send:', err))
+      }
+
+      addToast({
+        type: 'success',
+        message: 'Message sent successfully',
+      })
+
+      onSent?.()
+      onClose?.()
+    } catch (err) {
+      console.error('Failed to send message:', err)
+      addToast({
+        type: 'error',
+        message: `Failed to send message: ${err}`,
+      })
+    } finally {
+      sending = false
+    }
+  }
+  
+  // Handlers for confirmation dialogs
+  function handleConfirmEmptySubject() {
+    showEmptySubjectDialog = false
+    // Check for missing attachment next (if applicable)
+    if (attachments.length === 0 && bodyMentionsAttachment()) {
+      showMissingAttachmentDialog = true
+    } else {
+      doSend()
+    }
+  }
+  
+  function handleConfirmMissingAttachment() {
+    showMissingAttachmentDialog = false
+    doSend()
+  }
+
+  function handleClose() {
+    // Cancel any pending draft save
+    if (saveTimeoutId) {
+      clearTimeout(saveTimeoutId)
+      saveTimeoutId = null
+    }
+
+    // Always show confirmation dialog (even for empty content, since a draft may have been saved)
+    showCloseConfirm = true
+  }
+
+  // Discard: Delete draft from local DB and IMAP, then close
+  async function handleDiscardAndClose() {
+    closeLoading = 'discard'
+    try {
+      if (currentDraftId) {
+        await api.deleteDraft(currentDraftId)
+      }
+    } catch (err) {
+      console.error('Failed to delete draft:', err)
+      // Still close even if delete fails
+    }
+    showCloseConfirm = false
+    closeLoading = null
+    onCloseHandled?.()
+    onClose?.()
+  }
+
+  // Save & Close: Save current content as draft, then close
+  async function handleSaveAndClose() {
+    closeLoading = 'save'
+    try {
+      if (hasContent()) {
+        await saveDraft()
+      }
+    } catch (err) {
+      console.error('Failed to save draft:', err)
+      // Still close even if save fails
+    }
+    showCloseConfirm = false
+    closeLoading = null
+    onCloseHandled?.()
+    onClose?.()
+  }
+
+  // Keep Editing: Just close the dialog
+  function handleKeepEditing() {
+    showCloseConfirm = false
+    onCloseHandled?.()
+  }
+
+  // Pop out to detached window
+  async function handlePopOut() {
+    if (!api.openComposerWindow) {
+      // Not available in detached windows
+      return
+    }
+
+    poppingOut = true
+
+    try {
+      // Save draft first to get a draft ID
+      const message = buildMessage()
+      const result = await api.saveDraft(accountId, message, currentDraftId || '')
+      const savedDraftId = result.id
+
+      // Open detached composer window with the saved draft
+      await api.openComposerWindow(
+        accountId,
+        getDisplayMode(),
+        messageId || '',
+        savedDraftId
+      )
+
+      // Close this modal/inline composer
+      onClose?.()
+    } catch (err) {
+      console.error('Failed to pop out composer:', err)
+      addToast({
+        type: 'error',
+        message: 'Failed to open composer window',
+      })
+      poppingOut = false
+    }
+  }
+
+  // Insert image via file picker
+  function insertImage() {
+    // Create a hidden file input and click it
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'image/*'
+    input.onchange = async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0]
+      if (file) {
+        await handleInlineImageFile(file)
+      }
+    }
+    input.click()
+  }
+
+  // Toggle between rich text and plain text mode
+  function togglePlainTextMode() {
+    if (isPlainTextMode) {
+      // Switching from plain text to rich text
+      const html = plainTextToHtml(plainTextContent)
+      editor?.commands.setContent(html)
+      isPlainTextMode = false
+    } else {
+      // Switching from rich text to plain text
+      plainTextContent = htmlToPlainText(editor?.getHTML() || '')
+      isPlainTextMode = true
+    }
+    scheduleDraftSave()
+  }
+
+  // Keyboard shortcuts
+  function handleKeyDown(e: KeyboardEvent) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault()
+      handleSend()
+    }
+    if (e.key === 'd' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault()
+      handlePopOut()
+    }
+    // Alt+T to focus toolbar (hint mode)
+    if (e.key === 't' && e.altKey) {
+      e.preventDefault()
+      toolbarRef?.focus()
+    }
+    // Alt+A to attach files
+    if (e.key === 'a' && e.altKey) {
+      e.preventDefault()
+      handleAttachFiles()
+    }
+    if (e.key === 'Escape') {
+      handleClose()
+    }
+  }
+  
+  // Generate a unique Content-ID for inline images
+  function generateCID(): string {
+    inlineImageCounter++
+    return `image${inlineImageCounter}-${Date.now()}@aerion`
+  }
+  
+  // Handle an inline image file (from paste or drop)
+  async function handleInlineImageFile(file: File) {
+    try {
+      const dataUrl = await readFileAsDataUrl(file)
+      const cid = generateCID()
+      
+      // Extract base64 data and content type from data URL
+      const matches = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+      if (!matches) {
+        console.error('Invalid data URL format')
+        return
+      }
+      
+      const contentType = matches[1]
+      const base64Data = matches[2]
+      
+      // Store the inline image
+      const inlineImage: InlineImage = {
+        cid,
+        dataUrl,
+        contentType,
+        data: base64Data,
+        filename: file.name || `image${inlineImageCounter}.${contentType.split('/')[1] || 'png'}`,
+      }
+      inlineImages = [...inlineImages, inlineImage]
+      
+      // Insert the image into the editor with the data URL (for display)
+      // When sending, we'll convert data URLs to cid: references
+      editor?.chain().focus().setImage({ src: dataUrl, alt: inlineImage.filename }).run()
+      
+      scheduleDraftSave()
+    } catch (err) {
+      console.error('Failed to process inline image:', err)
+      addToast({
+        type: 'error',
+        message: 'Failed to insert image',
+      })
+    }
+  }
+  
+  // Attachment handling
+  async function handleAttachFiles() {
+    try {
+      const files = await api.pickAttachmentFiles()
+      if (files && files.length > 0) {
+        attachments = [...attachments, ...files]
+        scheduleDraftSave()
+      }
+    } catch (err) {
+      console.error('Failed to pick files:', err)
+      addToast({
+        type: 'error',
+        message: 'Failed to attach files',
+      })
+    }
+  }
+  
+  function removeAttachment(index: number) {
+    attachments = attachments.filter((_, i) => i !== index)
+    scheduleDraftSave()
+  }
+  
+  // Drag and drop handlers
+  function handleDragOver(e: DragEvent) {
+    e.preventDefault()
+    e.stopPropagation()
+    isDraggingOver = true
+  }
+  
+  function handleDragLeave(e: DragEvent) {
+    e.preventDefault()
+    e.stopPropagation()
+    isDraggingOver = false
+  }
+  
+  async function handleDrop(e: DragEvent) {
+    e.preventDefault()
+    e.stopPropagation()
+    isDraggingOver = false
+    
+    const files = e.dataTransfer?.files
+    if (!files || files.length === 0) return
+    
+    // Read files as attachments
+    const newAttachments: ComposerAttachment[] = []
+    
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]
+      try {
+        const data = await readFileAsBase64(file)
+        newAttachments.push({
+          filename: file.name,
+          contentType: file.type || 'application/octet-stream',
+          size: file.size,
+          data: data,
+        })
+      } catch (err) {
+        console.error('Failed to read dropped file:', err)
+      }
+    }
+    
+    if (newAttachments.length > 0) {
+      attachments = [...attachments, ...newAttachments]
+      scheduleDraftSave()
+    }
+  }
+  
+</script>
+
+<svelte:window on:keydown={handleKeyDown} />
+
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div 
+  class="flex flex-col h-full bg-background relative"
+  class:ring-2={isDraggingOver}
+  class:ring-primary={isDraggingOver}
+  class:ring-inset={isDraggingOver}
+  ondragover={handleDragOver}
+  ondragleave={handleDragLeave}
+  ondrop={handleDrop}
+  role="region"
+  aria-label="Email composer"
+>
+  <!-- Header -->
+  <div class="flex items-center justify-between px-4 py-3 border-b border-border">
+    <div class="flex items-center gap-3">
+      <h2 class="text-lg font-semibold">
+        {#if getDisplayMode() === 'new'}
+          New Message
+        {:else if getDisplayMode() === 'reply'}
+          Reply
+        {:else if getDisplayMode() === 'reply-all'}
+          Reply All
+        {:else if getDisplayMode() === 'forward'}
+          Forward
+        {/if}
+      </h2>
+      <!-- Draft status indicator -->
+      <span class="text-xs text-muted-foreground flex items-center gap-1">
+        {#if saveStatus === 'saving'}
+          <Icon icon="mdi:loading" class="w-3 h-3 animate-spin" />
+          Saving...
+        {:else if saveStatus === 'saved' && lastSavedAt}
+          {#if syncStatus === 'synced'}
+            <Icon icon="mdi:cloud-check" class="w-3 h-3 text-green-500" />
+            Synced
+          {:else if syncStatus === 'pending'}
+            <Icon icon="mdi:cloud-upload" class="w-3 h-3 text-blue-500" />
+            Saved locally
+          {:else if syncStatus === 'failed'}
+            <Icon icon="mdi:cloud-off-outline" class="w-3 h-3 text-yellow-500" />
+            Saved locally (offline)
+          {/if}
+        {:else if saveStatus === 'error'}
+          <Icon icon="mdi:alert-circle" class="w-3 h-3 text-red-500" />
+          Save failed
+        {/if}
+      </span>
+    </div>
+    <div class="flex items-center gap-2">
+      <!-- Pop-out button (only shown in main window, not detached) -->
+      {#if !isDetached && api.openComposerWindow}
+        <button
+          onclick={handlePopOut}
+          disabled={poppingOut || sending}
+          class="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          title="Open in new window"
+        >
+          {#if poppingOut}
+            <Icon icon="mdi:loading" class="w-4 h-4 animate-spin" />
+          {:else}
+            <Icon icon="mdi:open-in-new" class="w-4 h-4" />
+          {/if}
+        </button>
+      {/if}
+      <button
+        onclick={handleClose}
+        disabled={poppingOut}
+        class="px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors disabled:opacity-50"
+      >
+        Close
+      </button>
+      <button
+        onclick={handleSend}
+        disabled={sending || poppingOut || toRecipients.length === 0}
+        class="px-4 py-1.5 text-sm font-medium text-primary-foreground bg-primary hover:bg-primary/90 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+      >
+        {#if sending}
+          <Icon icon="mdi:loading" class="w-4 h-4 animate-spin" />
+          Sending...
+        {:else if poppingOut}
+          <Icon icon="mdi:loading" class="w-4 h-4 animate-spin" />
+          Opening...
+        {:else}
+          <Icon icon="mdi:send" class="w-4 h-4" />
+          Send
+        {/if}
+      </button>
+    </div>
+  </div>
+
+  <!-- Compose form -->
+  <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
+    <!-- From -->
+    <div class="flex items-center gap-2 px-4 py-2 border-b border-border">
+      <span class="text-sm text-muted-foreground w-16">From:</span>
+      <div class="flex-1">
+        <Select.Root value={selectedIdentityId} onValueChange={handleIdentityChange}>
+          <Select.Trigger class="h-8 border-0 bg-transparent shadow-none focus:ring-0">
+            <Select.Value placeholder="Select identity">
+              {#if selectedIdentityId}
+                {@const identity = identities.find(i => i.id === selectedIdentityId)}
+                {#if identity}
+                  {identity.name} &lt;{identity.email}&gt;
+                {/if}
+              {/if}
+            </Select.Value>
+          </Select.Trigger>
+          <Select.Content>
+            {#each identities as identity (identity.id)}
+              <Select.Item value={identity.id} label="{identity.name} <{identity.email}>" />
+            {/each}
+          </Select.Content>
+        </Select.Root>
+      </div>
+    </div>
+
+    <!-- To -->
+    <div class="flex items-start gap-2 px-4 py-2 border-b border-border">
+      <span class="text-sm text-muted-foreground w-16 pt-1">To:</span>
+      <div class="flex-1">
+        <RecipientInput
+          bind:recipients={toRecipients}
+          placeholder="Add recipients..."
+        />
+      </div>
+      {#if !showCc || !showBcc}
+        <div class="flex items-center gap-1 text-sm text-muted-foreground">
+          {#if !showCc}
+            <button onclick={() => showCc = true} class="hover:text-foreground">Cc</button>
+          {/if}
+          {#if !showBcc}
+            <button onclick={() => showBcc = true} class="hover:text-foreground">Bcc</button>
+          {/if}
+        </div>
+      {/if}
+    </div>
+
+    <!-- Cc -->
+    {#if showCc}
+      <div class="flex items-start gap-2 px-4 py-2 border-b border-border">
+        <span class="text-sm text-muted-foreground w-16 pt-1">Cc:</span>
+        <div class="flex-1">
+          <RecipientInput
+            bind:recipients={ccRecipients}
+            placeholder="Add Cc recipients..."
+          />
+        </div>
+      </div>
+    {/if}
+
+    <!-- Bcc -->
+    {#if showBcc}
+      <div class="flex items-start gap-2 px-4 py-2 border-b border-border">
+        <span class="text-sm text-muted-foreground w-16 pt-1">Bcc:</span>
+        <div class="flex-1">
+          <RecipientInput
+            bind:recipients={bccRecipients}
+            placeholder="Add Bcc recipients..."
+          />
+        </div>
+      </div>
+    {/if}
+
+    <!-- Subject -->
+    <div class="flex items-center gap-2 px-4 py-2 border-b border-border">
+      <label for="composer-subject" class="text-sm text-muted-foreground w-16">Subject:</label>
+      <input
+        id="composer-subject"
+        bind:value={subject}
+        type="text"
+        placeholder="Subject"
+        class="flex-1 bg-transparent text-sm focus:outline-none"
+        onkeydown={(e) => {
+          // Tab skips toolbar and goes directly to body
+          if (e.key === 'Tab' && !e.shiftKey) {
+            e.preventDefault()
+            editor?.commands.focus('start')
+          }
+        }}
+      />
+    </div>
+
+    <!-- Toolbar - extracted to separate component for performance -->
+    <!-- Alt+T to focus toolbar, Tab skips it -->
+    <EditorToolbar
+      bind:this={toolbarRef}
+      {editor}
+      {isPlainTextMode}
+      onTogglePlainText={togglePlainTextMode}
+      onInsertImage={insertImage}
+    />
+
+    <!-- Editor -->
+    <div class="flex-1 overflow-auto bg-white dark:bg-zinc-900">
+      {#if isPlainTextMode}
+        <textarea
+          bind:value={plainTextContent}
+          placeholder="Write your message..."
+          class="w-full h-full p-3 bg-transparent resize-none focus:outline-none font-mono text-sm"
+          oninput={scheduleDraftSave}
+        ></textarea>
+      {:else}
+        <div bind:this={editorElement} class="h-full"></div>
+      {/if}
+    </div>
+
+    <!-- Attachments List -->
+    <ComposerAttachmentList {attachments} onRemove={removeAttachment} />
+
+    <!-- Footer -->
+    <div class="flex items-center gap-2 px-4 py-2 border-t border-border text-sm text-muted-foreground">
+      <button 
+        onclick={handleAttachFiles}
+        class="flex items-center gap-1 hover:text-foreground transition-colors"
+      >
+        <Icon icon="mdi:attachment" class="w-4 h-4" />
+        Attach files
+      </button>
+      {#if attachments.length > 0}
+        <span class="text-xs">
+          {attachments.length} file{attachments.length !== 1 ? 's' : ''} attached
+        </span>
+      {/if}
+      <div class="flex-1"></div>
+      {#if showReadReceiptOption}
+        <label class="flex items-center gap-1.5 text-xs cursor-pointer hover:text-foreground transition-colors">
+          <input
+            type="checkbox"
+            bind:checked={requestReadReceipt}
+            class="w-3.5 h-3.5 rounded border-border accent-primary"
+          />
+          Request read receipt
+        </label>
+      {/if}
+      <span class="text-xs">Ctrl+Enter to send</span>
+    </div>
+  </div>
+  
+  <!-- Drag overlay -->
+  {#if isDraggingOver}
+    <div class="absolute inset-0 bg-primary/10 flex items-center justify-center pointer-events-none z-10">
+      <div class="bg-background border-2 border-dashed border-primary rounded-lg px-8 py-6 text-center">
+        <Icon icon="mdi:attachment" class="w-12 h-12 text-primary mx-auto mb-2" />
+        <p class="text-lg font-medium">Drop files to attach</p>
+      </div>
+    </div>
+  {/if}
+</div>
+
+<!-- Empty Subject Confirmation Dialog -->
+<AlertDialog.Root bind:open={showEmptySubjectDialog}>
+  <AlertDialog.Content>
+    <AlertDialog.Header>
+      <AlertDialog.Title>Send without subject?</AlertDialog.Title>
+      <AlertDialog.Description>
+        This message has no subject line. Are you sure you want to send it?
+      </AlertDialog.Description>
+    </AlertDialog.Header>
+    <AlertDialog.Footer>
+      <AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
+      <AlertDialog.Action onclick={handleConfirmEmptySubject}>Send anyway</AlertDialog.Action>
+    </AlertDialog.Footer>
+  </AlertDialog.Content>
+</AlertDialog.Root>
+
+<!-- Missing Attachment Confirmation Dialog -->
+<AlertDialog.Root bind:open={showMissingAttachmentDialog}>
+  <AlertDialog.Content>
+    <AlertDialog.Header>
+      <AlertDialog.Title>Attachment missing?</AlertDialog.Title>
+      <AlertDialog.Description>
+        Your message mentions an attachment, but no files are attached. Do you want to send it anyway?
+      </AlertDialog.Description>
+    </AlertDialog.Header>
+    <AlertDialog.Footer>
+      <AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
+      <AlertDialog.Action onclick={handleConfirmMissingAttachment}>Send anyway</AlertDialog.Action>
+    </AlertDialog.Footer>
+  </AlertDialog.Content>
+</AlertDialog.Root>
+
+<!-- Close Confirmation Dialog -->
+<ThreeOptionDialog
+  bind:open={showCloseConfirm}
+  title="Close this message?"
+  description="What would you like to do with this draft?"
+  option1Label="Discard"
+  option2Label="Save & Close"
+  option3Label="Keep Editing"
+  option1Variant="destructive"
+  option2Variant="default"
+  loading={closeLoading === 'discard' ? 'option1' : closeLoading === 'save' ? 'option2' : null}
+  onOption1={handleDiscardAndClose}
+  onOption2={handleSaveAndClose}
+  onOption3={handleKeepEditing}
+/>
+
+<style>
+  :global(.ProseMirror p.is-editor-empty:first-child::before) {
+    color: #adb5bd;
+    content: attr(data-placeholder);
+    float: left;
+    height: 0;
+    pointer-events: none;
+  }
+
+  /* Table styling for composer */
+  :global(.composer-editor table) {
+    border-collapse: collapse;
+    margin: 0;
+    overflow: hidden;
+    table-layout: fixed;
+    width: 100%;
+  }
+
+  :global(.composer-editor td),
+  :global(.composer-editor th) {
+    border: 1px solid hsl(var(--border));
+    box-sizing: border-box;
+    min-width: 1em;
+    padding: 6px 8px;
+    position: relative;
+    vertical-align: top;
+  }
+
+  :global(.composer-editor th) {
+    background-color: hsl(var(--muted));
+    font-weight: 600;
+  }
+</style>

@@ -1,0 +1,20 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=Aerion
+GenericName=Email
+Comment=A modern, cross-platform email client
+Keywords=Mail;E-mail;email;IMAP;SMTP;CardDAV;
+Icon=aerion
+TryExec=aerion
+Exec=aerion %U
+Terminal=false
+Categories=Network;Email;
+MimeType=x-scheme-handler/mailto;
+StartupNotify=true
+X-GNOME-UsesNotifications=true
+Actions=compose;
+
+[Desktop Action compose]
+Name=Compose New Email
+Exec=aerion mailto:

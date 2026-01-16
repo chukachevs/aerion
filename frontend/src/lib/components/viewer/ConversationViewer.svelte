@@ -1,0 +1,1037 @@
+<script lang="ts">
+  import { onMount, onDestroy } from 'svelte'
+  import Icon from '@iconify/svelte'
+  // @ts-ignore - wailsjs bindings
+  import { GetConversation, GetReadReceiptResponsePolicy, SendReadReceipt, IgnoreReadReceipt, GetMarkAsReadDelay, GetMessageSource } from '../../../../wailsjs/go/app/App'
+  // @ts-ignore - wailsjs bindings
+  import { MarkAsRead, MarkAsUnread, Star, Unstar, Archive, Trash, MarkAsSpam, DeletePermanently, Undo } from '../../../../wailsjs/go/app/App'
+  // @ts-ignore - wailsjs path
+  import { EventsOn, EventsOff } from '../../../../wailsjs/runtime/runtime'
+  // @ts-ignore - wailsjs path
+  import { message as messageModels } from '../../../../wailsjs/go/models'
+  import AttachmentList from './AttachmentList.svelte'
+  import EmailBody from './EmailBody.svelte'
+  import { toasts } from '$lib/stores/toast'
+  import { ConfirmDialog } from '$lib/components/ui/confirm-dialog'
+  import MessageContextMenu from '$lib/components/common/MessageContextMenu.svelte'
+
+  interface Props {
+    threadId?: string | null
+    folderId?: string | null
+    folderType?: string | null
+    accountId?: string | null
+    onReply?: (mode: 'reply' | 'reply-all' | 'forward', messageId: string) => void
+    onComposeToAddress?: (toAddress: string) => void
+    onEditDraft?: (draftId: string) => void
+    onActionComplete?: (autoSelectNext?: boolean) => void
+    isFocused?: boolean
+    isFlashing?: boolean
+  }
+
+  let {
+    threadId = null,
+    folderId = null,
+    folderType = null,
+    accountId = null,
+    onReply,
+    onComposeToAddress,
+    onEditDraft,
+    onActionComplete,
+    isFocused = false,
+    isFlashing = false,
+  }: Props = $props()
+
+  // State
+  let conversation = $state<messageModels.Conversation | null>(null)
+  let loading = $state(false)
+  let error = $state<string | null>(null)
+  
+  // Track which messages are expanded (unread messages auto-expand)
+  let expandedMessages = $state<Set<string>>(new Set())
+  
+  // Read receipt policy and tracking
+  let readReceiptPolicy = $state<'never' | 'ask' | 'always'>('ask')
+  let handledReadReceipts = $state<Set<string>>(new Set()) // Track locally handled receipts
+  let sendingReadReceipt = $state<Set<string>>(new Set()) // Track in-flight sends
+  
+  // Delete confirmation state
+  let showDeleteConfirm = $state(false)
+
+  // Auto-mark-as-read state
+  let markAsReadDelay = $state(1000) // Default 1 second, loaded from settings
+  let markAsReadTimer: ReturnType<typeof setTimeout> | null = null
+  let pendingMarkAsReadIds = $state<Set<string>>(new Set()) // Track message IDs we're marking as read
+
+  // Event listener cleanup functions
+  let cleanupFunctions: (() => void)[] = []
+
+  // Load settings and set up event listeners on mount
+  onMount(async () => {
+    try {
+      const [policy, delay] = await Promise.all([
+        GetReadReceiptResponsePolicy(),
+        GetMarkAsReadDelay(),
+      ])
+      readReceiptPolicy = policy as 'never' | 'ask' | 'always'
+      markAsReadDelay = delay
+    } catch (err) {
+      console.error('Failed to load settings:', err)
+    }
+
+    // Listen for message changes from backend
+    cleanupFunctions.push(
+      EventsOn('messages:flagsChanged', (data: { messageIds: string[], isRead: boolean }) => {
+        // Check if this is our own mark-as-read operation
+        const isOwnOperation = data.messageIds.every(id => pendingMarkAsReadIds.has(id))
+        
+        if (isOwnOperation) {
+          // Clear pending IDs and update local state
+          pendingMarkAsReadIds = new Set()
+          if (conversation?.messages) {
+            // Update isRead flag locally
+            for (const m of conversation.messages) {
+              if (data.messageIds.includes(m.id)) {
+                m.isRead = data.isRead
+              }
+            }
+            // Update conversation unread count
+            const delta = data.isRead ? -data.messageIds.length : data.messageIds.length
+            conversation.unreadCount = Math.max(0, (conversation.unreadCount || 0) + delta)
+            // Trigger reactivity
+            conversation = conversation
+          }
+        } else {
+          // External change - reload conversation
+          if (conversation?.messages?.some(m => data.messageIds.includes(m.id))) {
+            if (threadId && folderId) {
+              loadConversation(threadId, folderId)
+            }
+          }
+        }
+      })
+    )
+
+    cleanupFunctions.push(
+      EventsOn('messages:moved', (data: { messageIds: string[], destFolderId: string }) => {
+        if (conversation?.messages?.some(m => data.messageIds.includes(m.id))) {
+          // Reload or show empty state if moved to different folder
+          if (threadId && folderId) {
+            loadConversation(threadId, folderId)
+          }
+        }
+      })
+    )
+
+    cleanupFunctions.push(
+      EventsOn('messages:deleted', (messageIds: string[]) => {
+        if (conversation?.messages?.some(m => messageIds.includes(m.id))) {
+          // Clear conversation if messages deleted
+          conversation = null
+        }
+      })
+    )
+
+    cleanupFunctions.push(
+      EventsOn('undo:completed', () => {
+        // Reload conversation after undo
+        if (threadId && folderId) {
+          loadConversation(threadId, folderId)
+        }
+      })
+    )
+  })
+
+  onDestroy(() => {
+    // Clean up mark-as-read timer
+    if (markAsReadTimer) {
+      clearTimeout(markAsReadTimer)
+      markAsReadTimer = null
+    }
+    // Clean up all event listeners
+    cleanupFunctions.forEach(cleanup => cleanup())
+  })
+
+  // Load conversation when threadId changes
+  $effect(() => {
+    if (threadId && folderId) {
+      // Setting is already loaded on mount - no need to fetch on every conversation switch
+      loadConversation(threadId, folderId)
+    } else {
+      // Clear any pending mark-as-read timer when navigating away
+      if (markAsReadTimer) {
+        clearTimeout(markAsReadTimer)
+        markAsReadTimer = null
+      }
+      conversation = null
+      expandedMessages = new Set()
+    }
+  })
+
+  async function loadConversation(tid: string, fid: string) {
+    // Clear any pending mark-as-read timer from previous conversation
+    if (markAsReadTimer) {
+      clearTimeout(markAsReadTimer)
+      markAsReadTimer = null
+    }
+
+    loading = true
+    error = null
+
+    console.log('[ConversationViewer] Loading conversation:', { threadId: tid, folderId: fid })
+
+    try {
+      conversation = await GetConversation(tid, fid)
+      
+      console.log('[ConversationViewer] Loaded conversation:', {
+        subject: conversation?.subject,
+        messageCount: conversation?.messages?.length,
+        messages: conversation?.messages?.map(m => ({
+          id: m.id,
+          subject: m.subject,
+          bodyTextLen: m.bodyText?.length || 0,
+          bodyHtmlLen: m.bodyHtml?.length || 0,
+          threadId: m.threadId
+        }))
+      })
+      
+      // Auto-expand unread messages and the last message
+      if (conversation?.messages) {
+        const newExpanded = new Set<string>()
+        conversation.messages.forEach((m, i) => {
+          // Expand if unread or if it's the last message
+          if (!m.isRead || i === conversation!.messages!.length - 1) {
+            newExpanded.add(m.id)
+          }
+        })
+        expandedMessages = newExpanded
+
+        // Schedule auto-mark-as-read for unread messages
+        scheduleMarkAsRead(tid, conversation.messages)
+      }
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err)
+      console.error('Failed to load conversation:', err)
+    } finally {
+      loading = false
+    }
+  }
+
+  // Schedule marking messages as read based on user's delay setting
+  function scheduleMarkAsRead(capturedThreadId: string, messages: messageModels.Message[]) {
+    // Get unread message IDs
+    const unreadIds = messages.filter(m => !m.isRead).map(m => m.id)
+    
+    if (unreadIds.length === 0) {
+      return // No unread messages
+    }
+
+    // markAsReadDelay: -1 = manual only, 0 = immediate, >0 = delay in ms
+    if (markAsReadDelay < 0) {
+      return // Manual only, don't auto-mark
+    }
+
+    // Track these IDs as pending
+    pendingMarkAsReadIds = new Set(unreadIds)
+
+    if (markAsReadDelay === 0) {
+      // Immediate
+      MarkAsRead(unreadIds).catch(err => {
+        console.error('Failed to mark messages as read:', err)
+        pendingMarkAsReadIds = new Set() // Clear on error
+      })
+    } else {
+      // With delay
+      markAsReadTimer = setTimeout(() => {
+        // Verify we're still viewing the same conversation
+        if (threadId === capturedThreadId) {
+          MarkAsRead(unreadIds).catch(err => {
+            console.error('Failed to mark messages as read:', err)
+            pendingMarkAsReadIds = new Set() // Clear on error
+          })
+        } else {
+          pendingMarkAsReadIds = new Set() // Clear if we navigated away
+        }
+      }, markAsReadDelay)
+    }
+  }
+
+  function toggleMessage(messageId: string) {
+    const newSet = new Set(expandedMessages)
+    const wasExpanded = newSet.has(messageId)
+    
+    if (wasExpanded) {
+      newSet.delete(messageId)
+    } else {
+      newSet.add(messageId)
+      
+      // Check for auto-send read receipt on expand
+      if (readReceiptPolicy === 'always' && conversation?.messages) {
+        const msg = conversation.messages.find(m => m.id === messageId)
+        if (msg) {
+          handleMessageExpanded(msg)
+        }
+      }
+    }
+    expandedMessages = newSet
+  }
+
+  function expandAll() {
+    if (conversation?.messages) {
+      expandedMessages = new Set(conversation.messages.map(m => m.id))
+    }
+  }
+
+  function collapseAll() {
+    // Keep only the last message expanded
+    if (conversation?.messages && conversation.messages.length > 0) {
+      expandedMessages = new Set([conversation.messages[conversation.messages.length - 1].id])
+    }
+  }
+
+  function formatDate(dateStr: any): string {
+    const date = new Date(dateStr)
+    return `${date.toLocaleDateString()} at ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+  }
+
+  function getInitials(name: string): string {
+    return name
+      .split(' ')
+      .map((n) => n[0])
+      .join('')
+      .toUpperCase()
+      .slice(0, 2)
+  }
+
+  function getAvatarColor(email: string): string {
+    const colors = [
+      'bg-red-500', 'bg-orange-500', 'bg-amber-500', 'bg-yellow-500',
+      'bg-lime-500', 'bg-green-500', 'bg-emerald-500', 'bg-teal-500',
+      'bg-cyan-500', 'bg-sky-500', 'bg-blue-500', 'bg-indigo-500',
+      'bg-violet-500', 'bg-purple-500', 'bg-fuchsia-500', 'bg-pink-500',
+    ]
+    let hash = 0
+    for (let i = 0; i < email.length; i++) {
+      hash = email.charCodeAt(i) + ((hash << 5) - hash)
+    }
+    return colors[Math.abs(hash) % colors.length]
+  }
+
+  // Parse recipient list (JSON array format from backend)
+  function parseRecipients(recipientStr: string | undefined): Array<{ name: string; email: string }> {
+    if (!recipientStr) return []
+    try {
+      const parsed = JSON.parse(recipientStr)
+      if (Array.isArray(parsed)) {
+        return parsed.map((r: any) => ({
+          name: r.name || '',
+          email: r.email || ''
+        }))
+      }
+      return []
+    } catch {
+      return []
+    }
+  }
+
+  // Get the last message ID in the conversation (for reply actions)
+  // Exported for keyboard shortcut use from App.svelte
+  export function getLastMessageId(): string | null {
+    if (!conversation?.messages || conversation.messages.length === 0) return null
+    return conversation.messages[conversation.messages.length - 1].id
+  }
+
+  // Action button handlers
+  function handleReply() {
+    const messageId = getLastMessageId()
+    if (messageId && onReply) {
+      onReply('reply', messageId)
+    }
+  }
+
+  function handleReplyAll() {
+    const messageId = getLastMessageId()
+    if (messageId && onReply) {
+      onReply('reply-all', messageId)
+    }
+  }
+
+  function handleForward() {
+    const messageId = getLastMessageId()
+    if (messageId && onReply) {
+      onReply('forward', messageId)
+    }
+  }
+
+  async function handleArchive() {
+    if (!conversation?.messages) return
+    const messageIds = conversation.messages.map(m => m.id)
+    
+    try {
+      await Archive(messageIds)
+      toasts.success('Conversation archived', [
+        { label: 'Undo', onClick: handleUndo }
+      ])
+      onActionComplete?.(true)
+    } catch (err) {
+      toasts.error(`Failed to archive: ${err}`)
+    }
+  }
+
+  async function handleDelete() {
+    if (!conversation?.messages) return
+    
+    if (isTrashFolder) {
+      // Show confirmation dialog for permanent delete
+      showDeleteConfirm = true
+    } else {
+      // Move to trash (undoable)
+      const messageIds = conversation.messages.map(m => m.id)
+      try {
+        await Trash(messageIds)
+        toasts.success('Moved to trash', [
+          { label: 'Undo', onClick: handleUndo }
+        ])
+        onActionComplete?.(true)
+      } catch (err) {
+        toasts.error(`Failed to delete: ${err}`)
+      }
+    }
+  }
+
+  async function handleConfirmPermanentDelete() {
+    if (!conversation?.messages) return
+    const messageIds = conversation.messages.map(m => m.id)
+    
+    try {
+      await DeletePermanently(messageIds)
+      toasts.success('Permanently deleted')
+      showDeleteConfirm = false
+      onActionComplete?.(true)
+    } catch (err) {
+      toasts.error(`Failed to delete: ${err}`)
+      showDeleteConfirm = false
+    }
+  }
+
+  async function handleSpam() {
+    if (!conversation?.messages) return
+    const messageIds = conversation.messages.map(m => m.id)
+    
+    try {
+      await MarkAsSpam(messageIds)
+      toasts.success('Marked as spam', [
+        { label: 'Undo', onClick: handleUndo }
+      ])
+      onActionComplete?.(true)
+    } catch (err) {
+      toasts.error(`Failed to mark as spam: ${err}`)
+    }
+  }
+
+  async function handleStar() {
+    if (!conversation?.messages) return
+    
+    // Toggle based on current state - star if any unstarred, unstar if all starred
+    const allStarred = conversation.messages.every(m => m.isStarred)
+    const messageIds = conversation.messages.map(m => m.id)
+    
+    try {
+      if (allStarred) {
+        await Unstar(messageIds)
+        toasts.success('Removed star')
+      } else {
+        await Star(messageIds)
+        toasts.success('Starred')
+      }
+    } catch (err) {
+      toasts.error(`Failed to update star: ${err}`)
+    }
+  }
+
+  async function handleMarkRead() {
+    if (!conversation?.messages) return
+    
+    // Toggle based on current state
+    const allRead = conversation.messages.every(m => m.isRead)
+    const messageIds = conversation.messages.map(m => m.id)
+    
+    try {
+      if (allRead) {
+        await MarkAsUnread(messageIds)
+        toasts.success('Marked as unread')
+      } else {
+        await MarkAsRead(messageIds)
+        toasts.success('Marked as read')
+      }
+    } catch (err) {
+      toasts.error(`Failed to update read status: ${err}`)
+    }
+  }
+
+  async function handleUndo() {
+    try {
+      const description = await Undo()
+      toasts.success(`Undone: ${description}`)
+      // Reload conversation to show updated state
+      if (threadId && folderId) {
+        await loadConversation(threadId, folderId)
+      }
+      onActionComplete?.()
+    } catch (err) {
+      toasts.error(`Undo failed: ${err}`)
+    }
+  }
+
+  function handlePrint() {
+    window.print()
+  }
+
+  // Read receipt handling
+  async function handleSendReadReceipt(messageId: string, accountId: string) {
+    if (sendingReadReceipt.has(messageId)) return
+    
+    sendingReadReceipt = new Set([...sendingReadReceipt, messageId])
+    
+    try {
+      await SendReadReceipt(accountId, messageId)
+      handledReadReceipts = new Set([...handledReadReceipts, messageId])
+      toasts.success('Read receipt sent')
+    } catch (err) {
+      console.error('Failed to send read receipt:', err)
+      toasts.error('Failed to send read receipt')
+    } finally {
+      const newSet = new Set(sendingReadReceipt)
+      newSet.delete(messageId)
+      sendingReadReceipt = newSet
+    }
+  }
+
+  async function handleIgnoreReadReceipt(messageId: string, accountId: string) {
+    try {
+      await IgnoreReadReceipt(accountId, messageId)
+      handledReadReceipts = new Set([...handledReadReceipts, messageId])
+    } catch (err) {
+      console.error('Failed to ignore read receipt:', err)
+    }
+  }
+
+  // Check if message should show read receipt banner
+  function shouldShowReadReceiptBanner(msg: messageModels.Message): boolean {
+    // Don't show if policy is 'never'
+    if (readReceiptPolicy === 'never') return false
+    
+    // Don't show if no read receipt requested
+    if (!msg.readReceiptTo) return false
+    
+    // Don't show if already handled (from server or locally)
+    if (msg.readReceiptHandled || handledReadReceipts.has(msg.id)) return false
+    
+    return true
+  }
+
+  // Auto-send read receipt when message is expanded (for 'always' policy)
+  function handleMessageExpanded(msg: messageModels.Message) {
+    if (readReceiptPolicy === 'always' && shouldShowReadReceiptBanner(msg)) {
+      handleSendReadReceipt(msg.id, msg.accountId)
+    }
+  }
+
+  // Computed: are all messages in the conversation starred?
+  const allStarred = $derived(
+    conversation?.messages?.every(m => m.isStarred) ?? false
+  )
+
+  // Computed: are all messages in the conversation read?
+  const allRead = $derived(
+    conversation?.messages?.every(m => m.isRead) ?? false
+  )
+
+  // Computed: is this the Trash folder?
+  const isTrashFolder = $derived(folderType === 'trash')
+
+  // Computed: is this the Drafts folder?
+  const isDraftsFolder = $derived(folderType === 'drafts')
+
+  // Computed: all message IDs in the conversation (for context menu)
+  const allMessageIds = $derived(
+    conversation?.messages?.map((m) => m.id) || []
+  )
+
+  // Reference to the scrollable content area
+  let contentContainerRef = $state<HTMLDivElement | null>(null)
+  const SCROLL_AMOUNT = 100 // pixels to scroll per keypress
+
+  // Scroll the viewer up (exposed for keyboard navigation)
+  export function scrollUp() {
+    if (contentContainerRef) {
+      contentContainerRef.scrollBy({ top: -SCROLL_AMOUNT, behavior: 'smooth' })
+    }
+  }
+
+  // Scroll the viewer down (exposed for keyboard navigation)
+  export function scrollDown() {
+    if (contentContainerRef) {
+      contentContainerRef.scrollBy({ top: SCROLL_AMOUNT, behavior: 'smooth' })
+    }
+  }
+
+  // Expose action functions for keyboard shortcuts
+  export function toggleStar() {
+    handleStar()
+  }
+
+  export function markRead() {
+    handleMarkRead()
+  }
+
+  export function markUnread() {
+    // Invert the read state
+    if (allRead) return // Already handled by handleMarkRead toggle
+    handleMarkRead()
+  }
+
+  export function archive() {
+    handleArchive()
+  }
+
+  export function spam() {
+    handleSpam()
+  }
+
+  export function trash() {
+    handleDelete()
+  }
+
+  export function deletePermanently() {
+    handleConfirmPermanentDelete()
+  }
+
+  export function reply() {
+    handleReply()
+  }
+
+  export function replyAll() {
+    handleReplyAll()
+  }
+
+  export function forward() {
+    handleForward()
+  }
+
+  export function loadImages() {
+    // Dispatch custom event that EmailBody components listen to
+    window.dispatchEvent(new CustomEvent('load-remote-images'))
+  }
+
+  export function openAlwaysLoadDropdown() {
+    // Dispatch custom event that EmailBody components listen to
+    window.dispatchEvent(new CustomEvent('open-always-load-dropdown'))
+  }
+
+  // Handle action completion from context menu
+  function handleContextMenuActionComplete() {
+    // Reload conversation after context menu action
+    if (threadId && folderId) {
+      loadConversation(threadId, folderId)
+    }
+  }
+
+  // Copy text to clipboard with toast feedback
+  async function copyToClipboard(text: string, label: string = 'Text') {
+    try {
+      await navigator.clipboard.writeText(text)
+      toasts.success(`${label} copied to clipboard`)
+    } catch (err) {
+      toasts.error('Failed to copy to clipboard')
+    }
+  }
+
+  // Format email for display/copy: "Name <email>" or just "email"
+  function formatEmailForCopy(name: string | undefined, email: string): string {
+    if (name && name.trim()) {
+      return `${name} <${email}>`
+    }
+    return email
+  }
+
+  // View source state
+  let viewingSourceMessageId = $state<string | null>(null)
+  let messageSource = $state<string | null>(null)
+  let loadingSource = $state(false)
+
+  // Toggle view source for a message
+  async function toggleViewSource(msgId: string) {
+    if (viewingSourceMessageId === msgId) {
+      // Close source view
+      viewingSourceMessageId = null
+      messageSource = null
+      return
+    }
+
+    viewingSourceMessageId = msgId
+    loadingSource = true
+    messageSource = null
+
+    try {
+      const source = await GetMessageSource(msgId)
+      messageSource = source
+    } catch (err) {
+      toasts.error('Failed to load message source')
+      viewingSourceMessageId = null
+    } finally {
+      loadingSource = false
+    }
+  }
+
+</script>
+
+<div class="flex flex-col h-full {isFlashing ? 'pane-focus-flash' : ''}">
+  {#if !threadId}
+    <!-- No conversation selected -->
+    <div class="flex flex-col items-center justify-center h-full text-muted-foreground">
+      <Icon icon="mdi:email-open-outline" class="w-16 h-16 mb-4" />
+      <p class="text-lg">Select a conversation to read</p>
+    </div>
+  {:else if loading}
+    <!-- Loading -->
+    <div class="flex items-center justify-center h-full">
+      <Icon icon="mdi:loading" class="w-8 h-8 animate-spin text-muted-foreground" />
+    </div>
+  {:else if error}
+    <!-- Error -->
+    <div class="flex flex-col items-center justify-center h-full text-center px-4">
+      <Icon icon="mdi:alert-circle-outline" class="w-12 h-12 text-destructive mb-3" />
+      <p class="text-destructive mb-2">Failed to load conversation</p>
+      <p class="text-sm text-muted-foreground">{error}</p>
+      <button
+        class="mt-4 text-sm text-primary hover:underline"
+        onclick={() => loadConversation(threadId!, folderId!)}
+      >
+        Try again
+      </button>
+    </div>
+  {:else if conversation}
+    <!-- Header with Actions -->
+    <div class="flex items-center justify-between px-4 py-3 border-b border-border">
+      <div class="flex items-center gap-2">
+        <button
+          class="p-2 rounded-md hover:bg-muted transition-colors"
+          title="Reply"
+          onclick={handleReply}
+        >
+          <Icon icon="mdi:reply" class="w-5 h-5 text-muted-foreground" />
+        </button>
+        <button
+          class="p-2 rounded-md hover:bg-muted transition-colors"
+          title="Reply All"
+          onclick={handleReplyAll}
+        >
+          <Icon icon="mdi:reply-all" class="w-5 h-5 text-muted-foreground" />
+        </button>
+        <button
+          class="p-2 rounded-md hover:bg-muted transition-colors"
+          title="Forward"
+          onclick={handleForward}
+        >
+          <Icon icon="mdi:share" class="w-5 h-5 text-muted-foreground" />
+        </button>
+
+        <div class="w-px h-5 bg-border mx-1"></div>
+
+        <button 
+          class="p-2 rounded-md hover:bg-muted transition-colors" 
+          title="Archive"
+          onclick={handleArchive}
+        >
+          <Icon icon="mdi:archive-outline" class="w-5 h-5 text-muted-foreground" />
+        </button>
+        <button 
+          class="p-2 rounded-md hover:bg-muted transition-colors" 
+          title={isTrashFolder ? "Delete Permanently" : "Delete"}
+          onclick={handleDelete}
+        >
+          <Icon icon={isTrashFolder ? "mdi:delete-forever" : "mdi:delete-outline"} class="w-5 h-5 text-muted-foreground" />
+        </button>
+        <button 
+          class="p-2 rounded-md hover:bg-muted transition-colors" 
+          title="Mark as Spam"
+          onclick={handleSpam}
+        >
+          <Icon icon="mdi:alert-octagon-outline" class="w-5 h-5 text-muted-foreground" />
+        </button>
+
+        <div class="w-px h-5 bg-border mx-1"></div>
+
+        <button 
+          class="p-2 rounded-md hover:bg-muted transition-colors" 
+          title={allStarred ? 'Remove star' : 'Star'}
+          onclick={handleStar}
+        >
+          <Icon icon={allStarred ? "mdi:star" : "mdi:star-outline"} class="w-5 h-5 {allStarred ? 'text-yellow-500' : 'text-muted-foreground'}" />
+        </button>
+        <button 
+          class="p-2 rounded-md hover:bg-muted transition-colors" 
+          title={allRead ? 'Mark as unread' : 'Mark as read'}
+          onclick={handleMarkRead}
+        >
+          <Icon icon={allRead ? "mdi:email-open-outline" : "mdi:email-outline"} class="w-5 h-5 text-muted-foreground" />
+        </button>
+      </div>
+
+      <div class="flex items-center gap-2">
+        {#if conversation.messages && conversation.messages.length > 1}
+          <button 
+            class="p-2 rounded-md hover:bg-muted transition-colors" 
+            title="Expand All"
+            onclick={expandAll}
+          >
+            <Icon icon="mdi:unfold-more-horizontal" class="w-5 h-5 text-muted-foreground" />
+          </button>
+          <button 
+            class="p-2 rounded-md hover:bg-muted transition-colors" 
+            title="Collapse All"
+            onclick={collapseAll}
+          >
+            <Icon icon="mdi:unfold-less-horizontal" class="w-5 h-5 text-muted-foreground" />
+          </button>
+        {/if}
+        <button 
+          class="p-2 rounded-md hover:bg-muted transition-colors" 
+          title="Print"
+          onclick={handlePrint}
+        >
+          <Icon icon="mdi:printer-outline" class="w-5 h-5 text-muted-foreground" />
+        </button>
+      </div>
+    </div>
+
+    <!-- Conversation Content -->
+    <div bind:this={contentContainerRef} class="flex-1 min-h-0 overflow-y-auto scrollbar-thin">
+      <MessageContextMenu
+        messageIds={allMessageIds}
+        accountId={accountId || ''}
+        currentFolderId={folderId || ''}
+        folderType={folderType || 'inbox'}
+        isStarred={allStarred}
+        isRead={allRead}
+        onActionComplete={handleContextMenuActionComplete}
+        {onReply}
+      >
+        <div class="p-6">
+          <!-- Subject -->
+          <h1 class="text-xl font-semibold text-foreground mb-4">
+            {conversation.subject || '(No subject)'}
+          </h1>
+
+        <!-- Message Count Badge -->
+        {#if conversation.messages && conversation.messages.length > 1}
+          <div class="mb-4 text-sm text-muted-foreground">
+            {conversation.messages.length} messages in this conversation
+          </div>
+        {/if}
+
+        <!-- Stacked Messages -->
+        {#if conversation.messages}
+          <div class="space-y-4">
+            {#each conversation.messages as msg, index (msg.id)}
+              {@const isExpanded = expandedMessages.has(msg.id)}
+              {@const isLast = index === conversation.messages.length - 1}
+              
+              <div class="border border-border rounded-lg overflow-hidden">
+                <!-- Message Header (always visible, clickable to expand/collapse) -->
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <div
+                  class="w-full flex items-start gap-3 p-4 text-left hover:bg-muted/50 transition-colors cursor-pointer {!isExpanded ? 'bg-muted/30' : ''}"
+                  onclick={() => toggleMessage(msg.id)}
+                  onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') toggleMessage(msg.id) }}
+                  role="button"
+                  tabindex="0"
+                >
+                  <!-- Avatar -->
+                  <div
+                    class="w-10 h-10 rounded-full flex-shrink-0 flex items-center justify-center text-white text-sm font-medium {getAvatarColor(msg.fromEmail)}"
+                  >
+                    {getInitials(msg.fromName || msg.fromEmail)}
+                  </div>
+                  
+                  <!-- Header Info -->
+                  <div class="flex-1 min-w-0">
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <span class="font-medium text-foreground">{msg.fromName || 'Unknown'}</span>
+                      <span
+                        role="button"
+                        tabindex="0"
+                        class="text-sm text-muted-foreground hover:text-primary hover:underline cursor-pointer"
+                        title="Click to copy email address"
+                        onclick={(e) => { e.stopPropagation(); copyToClipboard(formatEmailForCopy(msg.fromName, msg.fromEmail), 'Email') }}
+                        onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); copyToClipboard(formatEmailForCopy(msg.fromName, msg.fromEmail), 'Email') }}}
+                      >&lt;{msg.fromEmail}&gt;</span>
+
+                      <!-- Unread indicator -->
+                      {#if !msg.isRead}
+                        <span class="w-2 h-2 rounded-full bg-primary flex-shrink-0"></span>
+                      {/if}
+                    </div>
+
+                    {#if msg.toList}
+                      {@const recipients = parseRecipients(msg.toList)}
+                      <div class="text-sm text-muted-foreground flex flex-wrap items-center gap-1">
+                        <span>to</span>
+                        {#each recipients as recipient, i}
+                          <span
+                            role="button"
+                            tabindex="0"
+                            class="hover:text-primary hover:underline cursor-pointer text-muted-foreground"
+                            title="Click to copy email address"
+                            onclick={(e) => { e.stopPropagation(); copyToClipboard(formatEmailForCopy(recipient.name, recipient.email), 'Email') }}
+                            onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); copyToClipboard(formatEmailForCopy(recipient.name, recipient.email), 'Email') }}}
+                          >{recipient.name || recipient.email}{i < recipients.length - 1 ? ',' : ''}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                    
+                    {#if !isExpanded}
+                      <!-- Show snippet when collapsed -->
+                      <p class="text-sm text-muted-foreground truncate mt-1">
+                        {msg.snippet || ''}
+                      </p>
+                    {/if}
+                  </div>
+                  
+                  <!-- Date, edit button (drafts), and expand icon -->
+                  <div class="flex items-center gap-2 flex-shrink-0">
+                    <span class="text-sm text-muted-foreground">
+                      {formatDate(msg.date)}
+                    </span>
+                    {#if isDraftsFolder}
+                      <button
+                        class="p-1 rounded hover:bg-muted transition-colors"
+                        title="Edit Draft"
+                        onclick={(e) => { e.stopPropagation(); onEditDraft?.(msg.id) }}
+                      >
+                        <Icon icon="mdi:pencil" class="w-4 h-4 text-muted-foreground" />
+                      </button>
+                    {/if}
+                    <Icon
+                      icon={isExpanded ? 'mdi:chevron-up' : 'mdi:chevron-down'}
+                      class="w-5 h-5 text-muted-foreground"
+                    />
+                  </div>
+                </div>
+                
+                <!-- Message Body (visible when expanded) -->
+                {#if isExpanded}
+                  <div class="px-4 pb-4 pt-0">
+                    <div class="ml-13 pl-3 border-l-2 border-border">
+                      <!-- Read Receipt Banner -->
+                      {#if shouldShowReadReceiptBanner(msg) && readReceiptPolicy === 'ask'}
+                        <div class="flex items-center justify-between gap-3 px-3 py-2 mb-4 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-md">
+                          <div class="flex items-center gap-2 text-sm text-blue-700 dark:text-blue-300">
+                            <Icon icon="mdi:email-check-outline" class="w-4 h-4 flex-shrink-0" />
+                            <span>The sender requested a read receipt.</span>
+                          </div>
+                          <div class="flex items-center gap-2">
+                            <button
+                              onclick={() => handleSendReadReceipt(msg.id, msg.accountId)}
+                              disabled={sendingReadReceipt.has(msg.id)}
+                              class="px-3 py-1 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded transition-colors disabled:opacity-50"
+                            >
+                              {#if sendingReadReceipt.has(msg.id)}
+                                <Icon icon="mdi:loading" class="w-3 h-3 animate-spin" />
+                              {:else}
+                                Send Receipt
+                              {/if}
+                            </button>
+                            <button
+                              onclick={() => handleIgnoreReadReceipt(msg.id, msg.accountId)}
+                              class="px-3 py-1 text-xs font-medium text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/50 rounded transition-colors"
+                            >
+                              Ignore
+                            </button>
+                          </div>
+                        </div>
+                      {:else if shouldShowReadReceiptBanner(msg) && readReceiptPolicy === 'always' && sendingReadReceipt.has(msg.id)}
+                        <div class="flex items-center gap-2 px-3 py-2 mb-4 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-md text-sm text-green-700 dark:text-green-300">
+                          <Icon icon="mdi:loading" class="w-4 h-4 animate-spin" />
+                          <span>Sending read receipt...</span>
+                        </div>
+                      {/if}
+
+                      <!-- Body -->
+                      <div class="mb-4">
+                        <EmailBody
+                          messageId={msg.id}
+                          accountId={msg.accountId}
+                          bodyHtml={msg.bodyHtml}
+                          bodyText={msg.bodyText}
+                          fromEmail={msg.fromEmail}
+                          onCompose={onComposeToAddress}
+                        />
+                      </div>
+
+                      <!-- Attachments -->
+                      {#if msg.hasAttachments}
+                        <div class="border-t border-border pt-4 mt-4">
+                          <h3 class="text-sm font-medium text-foreground mb-3 flex items-center gap-2">
+                            <Icon icon="mdi:paperclip" class="w-4 h-4" />
+                            Attachments
+                          </h3>
+                          <AttachmentList messageId={msg.id} />
+                        </div>
+                      {/if}
+
+                      <!-- View Source Button -->
+                      <div class="border-t border-border pt-4 mt-4">
+                        <button
+                          onclick={() => toggleViewSource(msg.id)}
+                          class="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
+                        >
+                          <Icon icon={viewingSourceMessageId === msg.id ? 'mdi:code-tags' : 'mdi:code-tags'} class="w-4 h-4" />
+                          {viewingSourceMessageId === msg.id ? 'Hide Source' : 'View Source'}
+                        </button>
+
+                        {#if viewingSourceMessageId === msg.id}
+                          <div class="mt-3">
+                            {#if loadingSource}
+                              <div class="flex items-center gap-2 text-sm text-muted-foreground">
+                                <Icon icon="mdi:loading" class="w-4 h-4 animate-spin" />
+                                Loading message source...
+                              </div>
+                            {:else if messageSource}
+                              <div class="relative">
+                                <button
+                                  onclick={() => copyToClipboard(messageSource || '', 'Message source')}
+                                  class="absolute top-2 right-2 p-1.5 rounded bg-muted hover:bg-muted/80 transition-colors"
+                                  title="Copy source"
+                                >
+                                  <Icon icon="mdi:content-copy" class="w-4 h-4" />
+                                </button>
+                                <pre class="text-xs bg-muted/50 p-4 rounded-md overflow-x-auto max-h-96 overflow-y-auto whitespace-pre-wrap break-all font-mono">{messageSource}</pre>
+                              </div>
+                            {/if}
+                          </div>
+                        {/if}
+                      </div>
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+        </div>
+      </MessageContextMenu>
+    </div>
+  {/if}
+</div>
+
+<!-- Permanent Delete Confirmation Dialog -->
+<ConfirmDialog
+  bind:open={showDeleteConfirm}
+  title="Delete Permanently?"
+  description="This conversation will be permanently deleted. This action cannot be undone."
+  confirmLabel="Delete Permanently"
+  variant="destructive"
+  onConfirm={handleConfirmPermanentDelete}
+  onCancel={() => showDeleteConfirm = false}
+/>

@@ -1,0 +1,277 @@
+<script lang="ts">
+  import Icon from '@iconify/svelte'
+  // @ts-ignore - wailsjs path
+  import { account, folder } from '../../../../wailsjs/go/models'
+  import type { SyncProgress } from '$lib/stores/accounts.svelte'
+
+  interface Props {
+    account: account.Account
+    folders: folder.FolderTree[]
+    loading: boolean
+    syncing: boolean
+    error: string | null
+    selectedFolderId: string
+    selectionSource: 'unified' | 'account' | null
+    isHeaderFocused?: boolean
+    isExpanded?: boolean
+    syncProgress?: SyncProgress | null
+    syncError?: { folderId: string; error: string } | null
+    onFolderSelect?: (accountId: string, folderId: string, folderPath: string, folderName: string, folderType: string) => void
+    onToggleExpanded?: () => void
+    onEdit?: () => void
+    onDelete?: () => void
+    onSync?: () => void
+  }
+
+  let {
+    account: acc,
+    folders,
+    loading,
+    syncing,
+    error,
+    selectedFolderId,
+    selectionSource,
+    isHeaderFocused = false,
+    isExpanded = true,
+    syncProgress = null,
+    syncError = null,
+    onFolderSelect,
+    onToggleExpanded,
+    onEdit,
+    onDelete,
+    onSync,
+  }: Props = $props()
+  
+  // Check if a folder is selected in this account tree (not in unified section)
+  function isFolderSelected(folderId: string): boolean {
+    return selectionSource === 'account' && selectedFolderId === folderId
+  }
+
+  let showMenu = $state(false)
+
+  // Toggle expand/collapse via callback
+  function toggleExpanded() {
+    onToggleExpanded?.()
+  }
+
+  // Folder type to icon mapping
+  const folderIcons: Record<string, string> = {
+    inbox: 'mdi:inbox',
+    sent: 'mdi:send',
+    drafts: 'mdi:file-document-edit-outline',
+    trash: 'mdi:delete-outline',
+    archive: 'mdi:archive-outline',
+    spam: 'mdi:alert-octagon-outline',
+    all: 'mdi:email-multiple-outline',
+    folder: 'mdi:folder-outline',
+  }
+
+  function getFolderIcon(type: string): string {
+    return folderIcons[type] || folderIcons.folder
+  }
+
+  function selectFolder(f: folder.Folder) {
+    onFolderSelect?.(acc.id, f.id, f.path, f.name, f.type)
+  }
+
+  function toggleMenu(e: MouseEvent) {
+    e.stopPropagation()
+    showMenu = !showMenu
+  }
+
+  function handleEdit() {
+    showMenu = false
+    onEdit?.()
+  }
+
+  function handleDelete() {
+    showMenu = false
+    onDelete?.()
+  }
+
+  function handleSync() {
+    showMenu = false
+    onSync?.()
+  }
+
+  // Close menu when clicking outside
+  function handleClickOutside() {
+    showMenu = false
+  }
+</script>
+
+<svelte:window onclick={handleClickOutside} />
+
+<div class="mb-2">
+  <!-- Account Header -->
+  <div class="relative group">
+    <button
+      class="w-full flex items-center gap-2 px-3 py-2 text-sm font-medium text-foreground hover:bg-muted/50 transition-colors {isHeaderFocused ? 'bg-muted ring-1 ring-primary/50' : ''}"
+      data-sidebar-item="account-header"
+      data-account-id={acc.id}
+      onclick={toggleExpanded}
+    >
+      <Icon
+        icon={isExpanded ? 'mdi:chevron-down' : 'mdi:chevron-right'}
+        class="w-4 h-4 text-muted-foreground"
+      />
+      <Icon icon="mdi:email-outline" class="w-4 h-4" />
+      <span class="truncate flex-1 text-left">{acc.name}</span>
+
+      {#if syncing}
+        <Icon icon="mdi:sync" class="w-4 h-4 animate-spin text-muted-foreground" />
+      {:else if error}
+        <span title={error}>
+          <Icon icon="mdi:alert-circle" class="w-4 h-4 text-destructive" />
+        </span>
+      {/if}
+    </button>
+
+    <!-- Account Menu Button -->
+    <button
+      class="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded hover:bg-muted transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100"
+      onclick={toggleMenu}
+    >
+      <Icon icon="mdi:dots-vertical" class="w-4 h-4 text-muted-foreground" />
+    </button>
+
+    <!-- Dropdown Menu -->
+    {#if showMenu}
+      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+      <div
+        class="absolute right-2 top-full mt-1 z-50 min-w-[160px] bg-popover border border-border rounded-md shadow-md py-1"
+        role="menu"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+      >
+        <button
+          class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors"
+          onclick={handleSync}
+        >
+          <Icon icon="mdi:sync" class="w-4 h-4" />
+          <span>Sync Now</span>
+        </button>
+        <button
+          class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors"
+          onclick={handleEdit}
+        >
+          <Icon icon="mdi:pencil-outline" class="w-4 h-4" />
+          <span>Edit Account</span>
+        </button>
+        <div class="my-1 border-t border-border"></div>
+        <button
+          class="w-full flex items-center gap-2 px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors"
+          onclick={handleDelete}
+        >
+          <Icon icon="mdi:delete-outline" class="w-4 h-4" />
+          <span>Delete Account</span>
+        </button>
+      </div>
+    {/if}
+  </div>
+
+  <!-- Sync Progress Bar / Error -->
+  {#if syncError}
+    <div class="px-3 py-1.5">
+      <div class="flex items-center gap-2 text-destructive">
+        <Icon icon="mdi:alert-circle" class="w-4 h-4 flex-shrink-0" />
+        <p class="text-xs">Sync error. Try again...</p>
+      </div>
+    </div>
+  {:else if syncing && syncProgress}
+    <div class="px-3 py-1.5">
+      <div class="h-1 bg-muted rounded-full overflow-hidden">
+        <div 
+          class="h-full bg-primary transition-all duration-300 ease-out" 
+          style="width: {syncProgress.percentage}%"
+        ></div>
+      </div>
+      <p class="text-xs text-muted-foreground mt-1">
+        {#if syncProgress.phase === 'folders'}
+          Syncing folders...
+        {:else if syncProgress.phase === 'messages'}
+          Fetching message list...
+        {:else if syncProgress.phase === 'headers'}
+          Fetching headers {syncProgress.percentage}%
+        {:else}
+          Syncing content {syncProgress.percentage}%
+        {/if}
+      </p>
+    </div>
+  {/if}
+
+  <!-- Folder List -->
+  {#if isExpanded}
+    <div class="ml-4">
+      {#if loading}
+        <div class="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground">
+          <Icon icon="mdi:loading" class="w-4 h-4 animate-spin" />
+          <span>Loading folders...</span>
+        </div>
+      {:else if folders.length === 0}
+        <div class="px-3 py-2 text-sm text-muted-foreground">
+          No folders synced
+        </div>
+      {:else}
+        {#each folders as tree (tree.folder?.id ?? 'unknown')}
+          {#if tree.folder}
+            <button
+              class="w-full flex items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors {isFolderSelected(tree.folder.id)
+                ? 'bg-primary/10 text-primary font-medium'
+                : 'text-foreground hover:bg-muted/50'}"
+              data-sidebar-item="folder"
+              data-folder-id={tree.folder.id}
+              onclick={() => selectFolder(tree.folder!)}
+            >
+              <Icon
+                icon={getFolderIcon(tree.folder.type)}
+                class="w-4 h-4 flex-shrink-0"
+              />
+              <span class="truncate flex-1 text-left">{tree.folder.name}</span>
+              {#if tree.folder.unreadCount > 0}
+                <span
+                  class="px-1.5 py-0.5 text-xs font-medium rounded-full bg-primary text-primary-foreground"
+                >
+                  {tree.folder.unreadCount}
+                </span>
+              {/if}
+            </button>
+
+            <!-- Nested folders -->
+            {#if tree.children && tree.children.length > 0}
+              <div class="ml-4">
+                {#each tree.children as childTree (childTree.folder?.id ?? 'unknown')}
+                  {#if childTree.folder}
+                    <button
+                      class="w-full flex items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors {isFolderSelected(childTree.folder.id)
+                        ? 'bg-primary/10 text-primary font-medium'
+                        : 'text-foreground hover:bg-muted/50'}"
+                      data-sidebar-item="folder"
+                      data-folder-id={childTree.folder.id}
+                      onclick={() => selectFolder(childTree.folder!)}
+                    >
+                      <Icon
+                        icon={getFolderIcon(childTree.folder.type)}
+                        class="w-4 h-4 flex-shrink-0"
+                      />
+                      <span class="truncate flex-1 text-left"
+                        >{childTree.folder.name}</span
+                      >
+                      {#if childTree.folder.unreadCount > 0}
+                        <span
+                          class="px-1.5 py-0.5 text-xs font-medium rounded-full bg-primary text-primary-foreground"
+                        >
+                          {childTree.folder.unreadCount}
+                        </span>
+                      {/if}
+                    </button>
+                  {/if}
+                {/each}
+              </div>
+            {/if}
+          {/if}
+        {/each}
+      {/if}
+    </div>
+  {/if}
+</div>

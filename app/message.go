@@ -1,0 +1,144 @@
+package app
+
+import (
+	"fmt"
+
+	"github.com/hkdb/aerion/internal/logging"
+	"github.com/hkdb/aerion/internal/message"
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
+)
+
+// ============================================================================
+// Message API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// GetMessages returns messages for a folder with pagination
+func (a *App) GetMessages(accountID, folderID string, offset, limit int) ([]*message.MessageHeader, error) {
+	return a.messageStore.ListByFolder(folderID, offset, limit)
+}
+
+// GetMessageCount returns the total message count for a folder
+func (a *App) GetMessageCount(accountID, folderID string) (int, error) {
+	return a.messageStore.CountByFolder(folderID)
+}
+
+// GetMessage returns a full message by ID
+func (a *App) GetMessage(id string) (*message.Message, error) {
+	return a.messageStore.Get(id)
+}
+
+// GetMessageSource fetches the raw RFC822 source of a message from the IMAP server
+func (a *App) GetMessageSource(messageID string) (string, error) {
+	log := logging.WithComponent("app")
+	log.Debug().Str("messageID", messageID).Msg("Fetching message source")
+
+	// Get the message to find the account, folder, and UID
+	msg, err := a.messageStore.Get(messageID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get message: %w", err)
+	}
+	if msg == nil {
+		return "", fmt.Errorf("message not found: %s", messageID)
+	}
+
+	// Fetch raw message from IMAP
+	rawBytes, err := a.syncEngine.FetchRawMessage(a.ctx, msg.AccountID, msg.FolderID, msg.UID)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch message source: %w", err)
+	}
+
+	return string(rawBytes), nil
+}
+
+// FetchMessageBody fetches the body for a message on-demand.
+// This is called when a message's body hasn't been fetched yet (BodyFetched = false).
+// It fetches the body from IMAP, updates the database, and returns the updated message.
+func (a *App) FetchMessageBody(messageID string) (*message.Message, error) {
+	log := logging.WithComponent("app")
+	log.Debug().Str("messageID", messageID).Msg("Fetching message body on-demand")
+
+	// Get the message first to get the account ID
+	msg, err := a.messageStore.Get(messageID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get message: %w", err)
+	}
+	if msg == nil {
+		return nil, fmt.Errorf("message not found: %s", messageID)
+	}
+
+	// If body is already fetched, just return it
+	if msg.BodyFetched {
+		return msg, nil
+	}
+
+	// Fetch the body from IMAP
+	updatedMsg, err := a.syncEngine.FetchMessageBody(a.ctx, msg.AccountID, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch message body: %w", err)
+	}
+
+	// Emit event so frontend knows the body is ready
+	wailsRuntime.EventsEmit(a.ctx, "message:bodyFetched", map[string]interface{}{
+		"messageId": messageID,
+	})
+
+	return updatedMsg, nil
+}
+
+// GetConversations returns conversations (threaded messages) for a folder with pagination
+// sortOrder can be "newest" (default) or "oldest"
+func (a *App) GetConversations(accountID, folderID string, offset, limit int, sortOrder string) ([]*message.Conversation, error) {
+	return a.messageStore.ListConversationsByFolder(folderID, offset, limit, sortOrder)
+}
+
+// GetConversationCount returns the total conversation count for a folder
+func (a *App) GetConversationCount(accountID, folderID string) (int, error) {
+	return a.messageStore.CountConversationsByFolder(folderID)
+}
+
+// GetUnifiedInboxConversations returns conversations from all inbox folders across all accounts
+func (a *App) GetUnifiedInboxConversations(offset, limit int, sortOrder string) ([]*message.Conversation, error) {
+	return a.messageStore.ListConversationsUnifiedInbox(offset, limit, sortOrder)
+}
+
+// GetUnifiedInboxCount returns the total conversation count across all inbox folders
+func (a *App) GetUnifiedInboxCount() (int, error) {
+	return a.messageStore.CountConversationsUnifiedInbox()
+}
+
+// GetUnifiedInboxUnreadCount returns the total unread count across all inbox folders
+func (a *App) GetUnifiedInboxUnreadCount() (int, error) {
+	return a.messageStore.GetUnifiedInboxUnreadCount()
+}
+
+// GetConversation returns all messages in a conversation/thread
+func (a *App) GetConversation(threadID, folderID string) (*message.Conversation, error) {
+	log := logging.WithComponent("app")
+	log.Debug().
+		Str("threadID", threadID).
+		Str("folderID", folderID).
+		Msg("GetConversation called")
+
+	conv, err := a.messageStore.GetConversation(threadID, folderID)
+	if err != nil {
+		log.Error().Err(err).Msg("GetConversation failed")
+		return nil, err
+	}
+
+	if conv != nil && conv.Messages != nil {
+		for i, m := range conv.Messages {
+			log.Debug().
+				Int("index", i).
+				Str("messageID", m.ID).
+				Str("subject", m.Subject).
+				Int("bodyTextLen", len(m.BodyText)).
+				Int("bodyHTMLLen", len(m.BodyHTML)).
+				Str("threadID", m.ThreadID).
+				Msg("GetConversation message")
+		}
+	} else {
+		log.Debug().Msg("GetConversation returned nil or no messages")
+	}
+
+	return conv, nil
+}

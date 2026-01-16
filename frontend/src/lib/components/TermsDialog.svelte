@@ -1,0 +1,124 @@
+<script lang="ts">
+  import { Dialog as DialogPrimitive } from 'bits-ui'
+  import { cn } from '$lib/utils'
+  import { Button } from '$lib/components/ui/button'
+  // @ts-ignore - wailsjs path
+  import { BrowserOpenURL } from '../../../wailsjs/runtime/runtime'
+
+  interface Props {
+    open: boolean
+    onAccept: () => void
+  }
+
+  let { open = $bindable(false), onAccept }: Props = $props()
+
+  let agreed = $state(false)
+
+  const PRIVACY_URL = 'https://github.com/hkdb/aerion/blob/main/docs/PRIVACY.md'
+  const TERMS_URL = 'https://github.com/hkdb/aerion/blob/main/docs/TERMS.md'
+
+  function openPrivacyPolicy() {
+    BrowserOpenURL(PRIVACY_URL)
+  }
+
+  function openTermsOfService() {
+    BrowserOpenURL(TERMS_URL)
+  }
+
+  function handleAccept() {
+    if (agreed) {
+      onAccept()
+    }
+  }
+
+  function preventClose(e: Event) {
+    e.preventDefault()
+  }
+</script>
+
+<DialogPrimitive.Root bind:open>
+  <DialogPrimitive.Portal>
+    <!-- Overlay - non-interactive (no close on click) -->
+    <DialogPrimitive.Overlay
+      class="fixed inset-0 z-50 bg-black/80 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
+    />
+
+    <!-- Content - no close button -->
+    <DialogPrimitive.Content
+      onInteractOutside={preventClose}
+      class={cn(
+        'fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-6 border bg-background p-8 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] sm:rounded-lg'
+      )}
+    >
+      <!-- Header -->
+      <div class="flex flex-col space-y-1.5 text-center sm:text-left">
+        <h2 class="text-lg font-semibold leading-none tracking-tight">
+          Terms of Use & Privacy Policy
+        </h2>
+        <p class="text-sm text-muted-foreground">
+          Please review and accept our terms to continue using Aerion.
+        </p>
+      </div>
+
+      <!-- Content -->
+      <div class="space-y-4">
+        <p class="text-sm text-muted-foreground">
+          These documents explain how the application handles your data and the terms
+          under which you may use this software.
+        </p>
+
+        <div class="flex flex-col gap-2">
+          <button
+            type="button"
+            onclick={openPrivacyPolicy}
+            class="text-sm text-primary hover:underline text-left flex items-center gap-2"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+              <polyline points="15 3 21 3 21 9"/>
+              <line x1="10" y1="14" x2="21" y2="3"/>
+            </svg>
+            Privacy Policy
+          </button>
+          <button
+            type="button"
+            onclick={openTermsOfService}
+            class="text-sm text-primary hover:underline text-left flex items-center gap-2"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+              <polyline points="15 3 21 3 21 9"/>
+              <line x1="10" y1="14" x2="21" y2="3"/>
+            </svg>
+            Terms of Use
+          </button>
+        </div>
+
+        <!-- Toggle -->
+        <button
+          type="button"
+          onclick={() => agreed = !agreed}
+          class="flex items-center gap-3 cursor-pointer w-full text-left"
+        >
+          <div
+            class="relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors duration-200 {agreed ? 'bg-primary' : 'bg-muted'}"
+          >
+            <span
+              class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-lg ring-0 transition-transform duration-200 {agreed ? 'translate-x-5' : 'translate-x-0.5'}"
+            ></span>
+          </div>
+          <span class="text-sm">
+            I have read and agree to the Terms of Use and Privacy Policy
+          </span>
+        </button>
+      </div>
+
+      <!-- Footer -->
+      <div class="flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2">
+        <Button onclick={handleAccept} disabled={!agreed}>
+          Accept & Continue
+        </Button>
+      </div>
+    </DialogPrimitive.Content>
+  </DialogPrimitive.Portal>
+</DialogPrimitive.Root>

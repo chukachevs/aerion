@@ -1,0 +1,5425 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	goSync "sync"
+	"time"
+
+	goImap "github.com/emersion/go-imap/v2"
+	"github.com/hkdb/aerion/internal/account"
+	"github.com/hkdb/aerion/internal/appstate"
+	"github.com/hkdb/aerion/internal/carddav"
+	"github.com/hkdb/aerion/internal/contact"
+	"github.com/hkdb/aerion/internal/credentials"
+	"github.com/hkdb/aerion/internal/database"
+	"github.com/hkdb/aerion/internal/draft"
+	"github.com/hkdb/aerion/internal/email"
+	"github.com/hkdb/aerion/internal/folder"
+	"github.com/hkdb/aerion/internal/imap"
+	"github.com/hkdb/aerion/internal/ipc"
+	"github.com/hkdb/aerion/internal/logging"
+	"github.com/hkdb/aerion/internal/message"
+	"github.com/hkdb/aerion/internal/oauth2"
+	"github.com/hkdb/aerion/internal/platform"
+	"github.com/hkdb/aerion/internal/settings"
+	"github.com/hkdb/aerion/internal/smtp"
+	"github.com/hkdb/aerion/internal/sync"
+	"github.com/hkdb/aerion/internal/undo"
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
+)
+
+// App struct holds the application state and dependencies
+type App struct {
+	ctx context.Context
+
+	// Paths
+	paths *platform.Paths
+
+	// Database
+	db *database.DB
+
+	// Stores
+	accountStore        *account.Store
+	folderStore         *folder.Store
+	messageStore        *message.Store
+	attachmentStore     *message.AttachmentStore
+	contactStore        *contact.Store
+	draftStore          *draft.Store
+	settingsStore       *settings.Store
+	appStateStore       *appstate.Store
+	imageAllowlistStore *settings.ImageAllowlistStore
+
+	// IMAP
+	imapPool   *imap.Pool
+	syncEngine *sync.Engine
+
+	// Background sync (polling + IDLE)
+	syncScheduler *sync.Scheduler
+	idleManager   *imap.IdleManager
+
+	// Credentials (keyring with fallback)
+	credStore *credentials.Store
+
+	// CardDAV
+	carddavStore     *carddav.Store
+	carddavSyncer    *carddav.Syncer
+	carddavScheduler *carddav.Scheduler
+
+	// Undo system
+	undoStack *undo.Stack
+
+	// IPC for multi-window support (composer windows)
+	ipcServer   ipc.Server
+	ipcTokenMgr *ipc.TokenManager
+
+	// OAuth2 manager
+	oauth2Manager *oauth2.Manager
+
+	// Temporary OAuth token storage (for pending account creation)
+	pendingOAuthTokens *oauth2.TokenResponse
+	pendingOAuthEmail  string
+
+	// Google Contacts API client (for OAuth accounts)
+	googleContactsClient *contact.GoogleContactsClient
+
+	// Pending mailto: URL data (from command line)
+	pendingMailto *MailtoData
+
+	// Full-text search indexer
+	ftsIndexer *message.FTSIndexer
+
+	// Sync management - tracks active syncs per account for cancel-and-restart
+	syncContexts    map[string]context.CancelFunc // keyed by accountID
+	syncLastRequest map[string]time.Time          // last sync request time for debounce
+	syncMu          goSync.Mutex                  // protects sync maps
+
+	// Sleep/wake detection for auto-sync on wake
+	sleepWakeMonitor platform.SleepWakeMonitor
+}
+
+// NewApp creates a new App application struct
+func NewApp() *App {
+	return &App{}
+}
+
+// startup is called when the app starts
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+
+	// Initialize logging - fatal only unless --debug flag is used
+	logLevel := "fatal"
+	if DebugMode() {
+		logLevel = "debug"
+	}
+	logging.Init(logging.Config{
+		Level:   logLevel,
+		Console: true,
+	})
+	log := logging.WithComponent("app")
+
+	// Get platform paths
+	paths, err := platform.GetPaths()
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to get platform paths")
+	}
+	a.paths = paths
+
+	// Ensure directories exist
+	if err := paths.EnsureDirectories(); err != nil {
+		log.Fatal().Err(err).Msg("Failed to create directories")
+	}
+	log.Info().
+		Str("config", paths.Config).
+		Str("data", paths.Data).
+		Str("cache", paths.Cache).
+		Msg("Initialized paths")
+
+	// Open database
+	db, err := database.Open(paths.DatabasePath())
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to open database")
+	}
+	a.db = db
+	log.Info().Str("path", paths.DatabasePath()).Msg("Opened database")
+
+	// Run migrations
+	if err := db.Migrate(); err != nil {
+		log.Fatal().Err(err).Msg("Failed to run migrations")
+	}
+	log.Info().Msg("Database migrations complete")
+
+	// Initialize stores
+	a.accountStore = account.NewStore(db)
+	a.folderStore = folder.NewStore(db)
+	a.messageStore = message.NewStore(db)
+	a.attachmentStore = message.NewAttachmentStore(db)
+	a.contactStore = contact.NewStore(db.DB)
+	a.draftStore = draft.NewStore(db)
+	a.settingsStore = settings.NewStore(db)
+	a.appStateStore = appstate.NewStore(db.DB)
+	a.imageAllowlistStore = settings.NewImageAllowlistStore(db)
+
+	// Scale database connection pool based on number of accounts
+	a.updateDBConnectionPool()
+
+	// Initialize vCard scanner for contact autocomplete
+	// Scans known Linux paths for .vcf files with 20 minute cache TTL
+	vcardScanner := contact.NewVCardScanner(contact.DefaultVCardPaths(), 20*time.Minute)
+	a.contactStore.SetVCardScanner(vcardScanner)
+	// Trigger initial scan in background
+	go vcardScanner.Scan()
+
+	// Initialize CardDAV support (will be fully set up after credStore is initialized)
+	a.carddavStore = carddav.NewStore(db.DB)
+
+	// Initialize credential store (keyring with encrypted DB fallback)
+	credStore, err := credentials.NewStore(db.DB, paths.Data)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize credential store")
+	}
+	a.credStore = credStore
+
+	// Initialize IMAP connection pool
+	poolConfig := imap.DefaultPoolConfig()
+	a.imapPool = imap.NewPool(poolConfig, a.getIMAPCredentials)
+
+	// Initialize sync engine
+	a.syncEngine = sync.NewEngine(a.imapPool, a.folderStore, a.messageStore, a.attachmentStore)
+
+	// Set up sync progress callback to emit events to frontend
+	a.syncEngine.SetProgressCallback(func(progress sync.SyncProgress) {
+		wailsRuntime.EventsEmit(ctx, "sync:progress", map[string]interface{}{
+			"accountId": progress.AccountID,
+			"folderId":  progress.FolderID,
+			"fetched":   progress.Fetched,
+			"total":     progress.Total,
+			"phase":     progress.Phase,
+		})
+	})
+
+	// Start connection pool cleanup routine
+	a.imapPool.StartCleanupRoutine(ctx)
+
+	// Start periodic WAL checkpoint routine to prevent WAL file from growing too large
+	go a.db.StartCheckpointRoutine(ctx)
+
+	// Initialize CardDAV syncer and scheduler
+	a.carddavSyncer = carddav.NewSyncer(a.carddavStore, a.credStore)
+	a.carddavScheduler = carddav.NewScheduler(a.carddavSyncer, a.carddavStore)
+
+	// Set up CardDAV search function for contact autocomplete
+	a.contactStore.SetCardDAVSearchFunc(func(query string, limit int) ([]*contact.Contact, error) {
+		contacts, err := a.carddavStore.SearchContacts(query, limit)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]*contact.Contact, len(contacts))
+		for i, c := range contacts {
+			result[i] = &contact.Contact{
+				Email:       c.Email,
+				DisplayName: c.DisplayName,
+				Source:      "carddav",
+			}
+		}
+		return result, nil
+	})
+
+	// Start CardDAV background sync scheduler
+	a.carddavScheduler.Start(ctx)
+
+	// Initialize undo stack (max 50 commands, 30 second timeout)
+	a.undoStack = undo.NewStack(50, 30*time.Second)
+
+	// Initialize OAuth2 manager for token refresh
+	a.oauth2Manager = oauth2.NewManager()
+
+	// Initialize Google Contacts client for OAuth account contact search
+	a.googleContactsClient = contact.NewGoogleContactsClient()
+
+	// Initialize IPC for multi-window support
+	a.initIPC(ctx)
+
+	// Initialize and start background email sync (polling + IDLE)
+	a.initBackgroundSync(ctx)
+
+	// Sync any pending drafts from previous sessions
+	go a.syncAllPendingDrafts()
+
+	// Initialize FTS indexer for full-text search
+	a.ftsIndexer = message.NewFTSIndexer(db.DB)
+
+	// Initialize sync context tracking for cancel-and-restart
+	a.syncContexts = make(map[string]context.CancelFunc)
+	a.syncLastRequest = make(map[string]time.Time)
+
+	// Initialize sleep/wake monitor for auto-sync on wake
+	a.initSleepWakeMonitor(ctx)
+
+	// Set up FTS progress callback to emit events to frontend
+	a.ftsIndexer.SetProgressCallback(func(folderID string, indexed, total int) {
+		percentage := 0
+		if total > 0 {
+			percentage = (indexed * 100) / total
+		}
+		wailsRuntime.EventsEmit(ctx, "fts:progress", map[string]interface{}{
+			"folderId":   folderID,
+			"indexed":    indexed,
+			"total":      total,
+			"percentage": percentage,
+		})
+	})
+
+	a.ftsIndexer.SetCompleteCallback(func(folderID string) {
+		wailsRuntime.EventsEmit(ctx, "fts:complete", map[string]interface{}{
+			"folderId": folderID,
+		})
+	})
+
+	// Start background FTS indexing after a short delay to let initial sync complete
+	go func() {
+		time.Sleep(5 * time.Second)
+		log.Info().Msg("Starting background FTS indexing")
+		wailsRuntime.EventsEmit(ctx, "fts:indexing", map[string]interface{}{
+			"status": "started",
+		})
+		if err := a.ftsIndexer.IndexAllFolders(ctx); err != nil {
+			log.Error().Err(err).Msg("Background FTS indexing failed")
+		} else {
+			log.Info().Msg("Background FTS indexing completed")
+			wailsRuntime.EventsEmit(ctx, "fts:indexing", map[string]interface{}{
+				"status": "completed",
+			})
+		}
+	}()
+
+	log.Info().Msg("Aerion started successfully")
+}
+
+// shuttingDown tracks if shutdown has been initiated to prevent multiple triggers
+var shuttingDown bool
+
+// beforeClose is called when the window is about to close (e.g., OS close signal)
+func (a *App) beforeClose(ctx context.Context) bool {
+	if shuttingDown {
+		// Already shutting down, allow the close
+		return false
+	}
+
+	log := logging.WithComponent("app")
+	log.Info().Msg("Window close requested, showing shutdown overlay")
+
+	shuttingDown = true
+
+	// Emit event to show shutdown overlay
+	wailsRuntime.EventsEmit(a.ctx, "app:shutting-down")
+
+	// Schedule actual quit after UI has time to render
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		wailsRuntime.Quit(a.ctx)
+	}()
+
+	// Prevent immediate close
+	return true
+}
+
+// InitiateShutdown triggers the application quit (called from frontend)
+func (a *App) InitiateShutdown() {
+	if shuttingDown {
+		return
+	}
+	shuttingDown = true
+
+	log := logging.WithComponent("app")
+	log.Info().Msg("Initiating shutdown")
+	wailsRuntime.Quit(a.ctx)
+}
+
+// shutdown is called when the app is closing
+func (a *App) shutdown(ctx context.Context) {
+	log := logging.WithComponent("app")
+
+	// Broadcast shutdown to all composer windows
+	if a.ipcServer != nil {
+		clients := a.ipcServer.Clients()
+		if len(clients) > 0 {
+			log.Info().Int("count", len(clients)).Msg("Notifying composer windows of shutdown")
+			msg, _ := ipc.NewMessage(ipc.TypeShutdown, ipc.ShutdownPayload{
+				Reason: "main window closing",
+			})
+			a.ipcServer.Broadcast(msg)
+			// Give composers a moment to save drafts
+			time.Sleep(500 * time.Millisecond)
+		}
+		a.ipcServer.Stop()
+		log.Info().Msg("IPC server stopped")
+	}
+
+	// Stop email sync scheduler
+	if a.syncScheduler != nil {
+		a.syncScheduler.Stop()
+		log.Info().Msg("Email sync scheduler stopped")
+	}
+
+	// Stop IDLE manager
+	if a.idleManager != nil {
+		a.idleManager.Stop()
+		log.Info().Msg("IDLE manager stopped")
+	}
+
+	// Stop sleep/wake monitor
+	if a.sleepWakeMonitor != nil {
+		a.sleepWakeMonitor.Stop()
+		log.Info().Msg("Sleep/wake monitor stopped")
+	}
+
+	// Stop CardDAV scheduler
+	if a.carddavScheduler != nil {
+		a.carddavScheduler.Stop()
+		log.Info().Msg("CardDAV scheduler stopped")
+	}
+
+	// Close all IMAP connections
+	if a.imapPool != nil {
+		a.imapPool.CloseAll()
+		log.Info().Msg("IMAP connections closed")
+	}
+
+	if a.db != nil {
+		a.db.Close()
+		log.Info().Msg("Database closed")
+	}
+
+	log.Info().Msg("Aerion shutdown complete")
+}
+
+// updateDBConnectionPool scales the database connection pool based on account count.
+// This should be called at startup and whenever accounts are added or removed.
+func (a *App) updateDBConnectionPool() {
+	accounts, err := a.accountStore.List()
+	if err != nil {
+		// On error, use a reasonable default
+		a.db.UpdateIdleConns(0)
+		return
+	}
+	a.db.UpdateIdleConns(len(accounts))
+}
+
+// getIMAPCredentials returns IMAP credentials for an account
+// Handles both password and OAuth2 authentication
+func (a *App) getIMAPCredentials(accountID string) (*imap.ClientConfig, error) {
+	log := logging.WithComponent("app.credentials")
+
+	acc, err := a.accountStore.Get(accountID)
+	if err != nil {
+		log.Error().Err(err).Str("accountID", accountID).Msg("Failed to get account")
+		return nil, err
+	}
+	if acc == nil {
+		log.Error().Str("accountID", accountID).Msg("Account not found")
+		return nil, fmt.Errorf("account not found: %s", accountID)
+	}
+
+	log.Debug().
+		Str("accountID", accountID).
+		Str("email", acc.Email).
+		Str("authType", string(acc.AuthType)).
+		Str("imapHost", acc.IMAPHost).
+		Msg("Getting IMAP credentials")
+
+	config := imap.DefaultConfig()
+	config.Host = acc.IMAPHost
+	config.Port = acc.IMAPPort
+	config.Security = imap.SecurityType(acc.IMAPSecurity)
+	config.Username = acc.Username
+
+	// Handle authentication based on auth type
+	if acc.AuthType == account.AuthOAuth2 {
+		log.Debug().Str("accountID", accountID).Msg("Using OAuth2 authentication")
+		// Get valid OAuth token (refreshing if needed)
+		tokens, err := a.getValidOAuthToken(accountID)
+		if err != nil {
+			log.Error().Err(err).Str("accountID", accountID).Msg("Failed to get OAuth token")
+			return nil, fmt.Errorf("failed to get OAuth token: %w", err)
+		}
+		log.Debug().
+			Str("accountID", accountID).
+			Time("expiresAt", tokens.ExpiresAt).
+			Int("tokenLen", len(tokens.AccessToken)).
+			Msg("OAuth token retrieved successfully")
+		config.AuthType = imap.AuthTypeOAuth2
+		config.AccessToken = tokens.AccessToken
+	} else {
+		log.Debug().Str("accountID", accountID).Msg("Using password authentication")
+		// Default to password authentication
+		password, err := a.credStore.GetPassword(accountID)
+		if err != nil {
+			log.Error().Err(err).Str("accountID", accountID).Msg("Failed to get password")
+			return nil, fmt.Errorf("failed to get password: %w", err)
+		}
+		config.AuthType = imap.AuthTypePassword
+		config.Password = password
+	}
+
+	log.Debug().
+		Str("accountID", accountID).
+		Str("authType", string(config.AuthType)).
+		Msg("IMAP credentials prepared")
+
+	return &config, nil
+}
+
+// getValidOAuthToken returns a valid OAuth token, refreshing if needed
+// If refresh fails, emits an event for the frontend to prompt re-authorization
+func (a *App) getValidOAuthToken(accountID string) (*credentials.OAuthTokens, error) {
+	log := logging.WithComponent("app")
+
+	tokens, err := a.credStore.GetOAuthTokens(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OAuth tokens: %w", err)
+	}
+
+	// Check if token expires within 5 minutes
+	if tokens.IsExpiringSoon(5 * time.Minute) {
+		log.Debug().
+			Str("account_id", accountID).
+			Time("expires_at", tokens.ExpiresAt).
+			Msg("OAuth token expiring soon, refreshing")
+
+		// Refresh the token
+		newTokenResp, err := a.oauth2Manager.RefreshToken(tokens.Provider, tokens.RefreshToken)
+		if err != nil {
+			log.Error().Err(err).
+				Str("account_id", accountID).
+				Msg("OAuth token refresh failed")
+
+			// Emit event for frontend to prompt re-authorization
+			wailsRuntime.EventsEmit(a.ctx, "oauth:reauth-required", map[string]interface{}{
+				"accountId": accountID,
+				"provider":  tokens.Provider,
+				"error":     err.Error(),
+			})
+
+			return nil, fmt.Errorf("OAuth token refresh failed, re-authorization required: %w", err)
+		}
+
+		// Calculate new expiry time
+		expiresAt := time.Now().Add(time.Duration(newTokenResp.ExpiresIn) * time.Second)
+
+		// Update tokens in store
+		tokens.AccessToken = newTokenResp.AccessToken
+		tokens.ExpiresAt = expiresAt
+		if newTokenResp.RefreshToken != "" {
+			tokens.RefreshToken = newTokenResp.RefreshToken
+		}
+
+		if err := a.credStore.SetOAuthTokens(accountID, tokens); err != nil {
+			log.Warn().Err(err).Msg("Failed to save refreshed OAuth tokens")
+			// Continue anyway - we have valid tokens in memory
+		}
+
+		log.Info().
+			Str("account_id", accountID).
+			Time("new_expires_at", expiresAt).
+			Msg("OAuth token refreshed successfully")
+	}
+
+	return tokens, nil
+}
+
+// ============================================================================
+// Account API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// GetAccounts returns all configured accounts
+func (a *App) GetAccounts() ([]*account.Account, error) {
+	return a.accountStore.List()
+}
+
+// GetAccount returns a single account by ID
+func (a *App) GetAccount(id string) (*account.Account, error) {
+	return a.accountStore.Get(id)
+}
+
+// AddAccount creates a new email account
+func (a *App) AddAccount(config account.AccountConfig) (*account.Account, error) {
+	log := logging.WithComponent("app")
+
+	// Create account in database
+	acc, err := a.accountStore.Create(&config)
+	if err != nil {
+		log.Error().Err(err).Str("email", config.Email).Msg("Failed to create account")
+		return nil, err
+	}
+
+	// Store password in credential store
+	if config.Password != "" {
+		if err := a.credStore.SetPassword(acc.ID, config.Password); err != nil {
+			log.Error().Err(err).Str("account_id", acc.ID).Msg("Failed to store password")
+			// Delete the account since we can't store credentials
+			a.accountStore.Delete(acc.ID)
+			return nil, fmt.Errorf("failed to store password: %w", err)
+		}
+	}
+
+	// Scale database connection pool for new account
+	a.updateDBConnectionPool()
+
+	// Start IDLE for the new account
+	if a.idleManager != nil && acc.Enabled {
+		a.idleManager.StartAccount(acc.ID, acc.Name)
+	}
+
+	log.Info().Str("account_id", acc.ID).Str("email", acc.Email).Msg("Account created")
+	return acc, nil
+}
+
+// UpdateAccount updates an existing account
+func (a *App) UpdateAccount(id string, config account.AccountConfig) (*account.Account, error) {
+	log := logging.WithComponent("app")
+
+	// Get existing account to check for sync period changes
+	existingAcc, err := a.accountStore.Get(id)
+	if err != nil {
+		log.Error().Err(err).Str("account_id", id).Msg("Failed to get existing account")
+		return nil, fmt.Errorf("failed to get existing account: %w", err)
+	}
+	if existingAcc == nil {
+		return nil, fmt.Errorf("account not found: %s", id)
+	}
+
+	// Validate folder mappings if any are set
+	folderPaths := map[string]string{
+		"sent":    config.SentFolderPath,
+		"drafts":  config.DraftsFolderPath,
+		"trash":   config.TrashFolderPath,
+		"spam":    config.SpamFolderPath,
+		"archive": config.ArchiveFolderPath,
+		"all":     config.AllMailFolderPath,
+		"starred": config.StarredFolderPath,
+	}
+
+	for folderType, path := range folderPaths {
+		if path != "" {
+			f, err := a.folderStore.GetByPath(id, path)
+			if err != nil {
+				return nil, fmt.Errorf("error checking %s folder: %w", folderType, err)
+			}
+			if f == nil {
+				return nil, fmt.Errorf("%s folder not found: %s", folderType, path)
+			}
+		}
+	}
+
+	// Check if sync period changed
+	syncPeriodChanged := existingAcc.SyncPeriodDays != config.SyncPeriodDays
+
+	acc, err := a.accountStore.Update(id, &config)
+	if err != nil {
+		log.Error().Err(err).Str("account_id", id).Msg("Failed to update account")
+		return nil, err
+	}
+
+	// Update password in credential store if provided
+	if config.Password != "" {
+		if err := a.credStore.SetPassword(id, config.Password); err != nil {
+			log.Error().Err(err).Str("account_id", id).Msg("Failed to update password")
+			return nil, fmt.Errorf("failed to update password: %w", err)
+		}
+	}
+
+	// If sync period changed, cancel any running sync and trigger a new one
+	if syncPeriodChanged && a.syncScheduler != nil {
+		log.Info().
+			Str("account_id", id).
+			Int("old_sync_period", existingAcc.SyncPeriodDays).
+			Int("new_sync_period", config.SyncPeriodDays).
+			Msg("Sync period changed, cancelling current sync and triggering new sync")
+
+		a.syncScheduler.CancelSync(id)
+		// Small delay to allow cancellation to complete
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			a.syncScheduler.TriggerSync(id)
+		}()
+	}
+
+	log.Info().Str("account_id", id).Msg("Account updated")
+	return acc, nil
+}
+
+// RemoveAccount deletes an account and all its data
+func (a *App) RemoveAccount(id string) error {
+	log := logging.WithComponent("app")
+
+	// Stop IDLE for this account
+	if a.idleManager != nil {
+		a.idleManager.StopAccount(id)
+	}
+
+	// Close any IMAP connections for this account
+	a.imapPool.CloseAccount(id)
+
+	// Delete from database (cascades to folders, messages, etc.)
+	if err := a.accountStore.Delete(id); err != nil {
+		log.Error().Err(err).Str("account_id", id).Msg("Failed to delete account")
+		return err
+	}
+
+	// Delete credentials from credential store
+	if err := a.credStore.DeleteAllCredentials(id); err != nil {
+		log.Warn().Err(err).Str("account_id", id).Msg("Failed to delete credentials")
+	}
+
+	// Scale database connection pool after removing account
+	a.updateDBConnectionPool()
+
+	log.Info().Str("account_id", id).Msg("Account removed")
+	return nil
+}
+
+// SetAccountEnabled enables or disables an account
+func (a *App) SetAccountEnabled(id string, enabled bool) error {
+	err := a.accountStore.SetEnabled(id, enabled)
+	if err != nil {
+		return err
+	}
+
+	// Update IDLE manager
+	if a.idleManager != nil {
+		if enabled {
+			// Start IDLE for the account
+			acc, err := a.accountStore.Get(id)
+			if err == nil && acc != nil {
+				a.idleManager.StartAccount(acc.ID, acc.Name)
+			}
+		} else {
+			// Stop IDLE for the account
+			a.idleManager.StopAccount(id)
+		}
+	}
+
+	return nil
+}
+
+// ReorderAccounts updates the order of accounts
+func (a *App) ReorderAccounts(ids []string) error {
+	return a.accountStore.Reorder(ids)
+}
+
+// GetIdentities returns all identities for an account
+func (a *App) GetIdentities(accountID string) ([]*account.Identity, error) {
+	return a.accountStore.GetIdentities(accountID)
+}
+
+// GetIdentity returns a single identity by ID
+func (a *App) GetIdentity(identityID string) (*account.Identity, error) {
+	return a.accountStore.GetIdentity(identityID)
+}
+
+// CreateIdentity creates a new email identity for an account
+func (a *App) CreateIdentity(accountID string, config account.IdentityConfig) (*account.Identity, error) {
+	return a.accountStore.CreateIdentity(accountID, &config)
+}
+
+// UpdateIdentity updates an existing identity
+func (a *App) UpdateIdentity(identityID string, config account.IdentityConfig) (*account.Identity, error) {
+	return a.accountStore.UpdateIdentity(identityID, &config)
+}
+
+// DeleteIdentity deletes an identity (cannot delete the default identity)
+func (a *App) DeleteIdentity(identityID string) error {
+	return a.accountStore.DeleteIdentity(identityID)
+}
+
+// SetDefaultIdentity sets an identity as the default for sending
+func (a *App) SetDefaultIdentity(accountID, identityID string) error {
+	return a.accountStore.SetDefaultIdentity(accountID, identityID)
+}
+
+// ============================================================================
+// Folder API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// GetFolders returns all folders for an account
+func (a *App) GetFolders(accountID string) ([]*folder.Folder, error) {
+	folders, err := a.folderStore.List(accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Sort folders (special folders first)
+	folder.SortFolders(folders)
+	return folders, nil
+}
+
+// GetFolderTree returns folders as a tree structure
+func (a *App) GetFolderTree(accountID string) ([]*folder.FolderTree, error) {
+	folders, err := a.folderStore.List(accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Sort folders (INBOX first, then special folders, then alphabetically)
+	folder.SortFolders(folders)
+	return folder.BuildTree(folders), nil
+}
+
+// SyncFolders synchronizes the folder list with the IMAP server
+func (a *App) SyncFolders(accountID string) error {
+	log := logging.WithComponent("app")
+	err := a.syncEngine.SyncFolders(a.ctx, accountID)
+	if err == nil {
+		// Checkpoint WAL after heavy sync operation
+		if checkpointErr := a.db.Checkpoint(); checkpointErr != nil {
+			log.Warn().Err(checkpointErr).Msg("WAL checkpoint after SyncFolders failed")
+		}
+	}
+	return err
+}
+
+// GetAccountFoldersForMapping returns all folders for an account (for folder mapping UI).
+// Triggers a folder sync if no folders exist yet.
+func (a *App) GetAccountFoldersForMapping(accountID string) ([]*folder.Folder, error) {
+	log := logging.WithComponent("app")
+
+	folders, err := a.folderStore.List(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list folders: %w", err)
+	}
+
+	// If no folders, trigger sync first
+	if len(folders) == 0 {
+		log.Info().Str("accountID", accountID).Msg("No folders found, triggering sync")
+		if err := a.syncEngine.SyncFolders(a.ctx, accountID); err != nil {
+			return nil, fmt.Errorf("failed to sync folders: %w", err)
+		}
+		folders, err = a.folderStore.List(accountID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list folders after sync: %w", err)
+		}
+	}
+
+	// Sort using existing logic
+	folder.SortFolders(folders)
+	return folders, nil
+}
+
+// GetAutoDetectedFolders returns the auto-detected special folders for an account.
+// Returns map of folder type -> folder path (e.g., {"sent": "Sent Mail", "trash": "Deleted Items"}).
+func (a *App) GetAutoDetectedFolders(accountID string) (map[string]string, error) {
+	folders, err := a.folderStore.List(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list folders: %w", err)
+	}
+
+	result := make(map[string]string)
+	for _, f := range folders {
+		if f.Type != folder.TypeFolder && f.Type != folder.TypeInbox {
+			result[string(f.Type)] = f.Path
+		}
+	}
+	return result, nil
+}
+
+// GetSpecialFolder returns the folder for a special type, checking account mappings first.
+// If no mapping is set, falls back to auto-detected folder type.
+func (a *App) GetSpecialFolder(accountID string, folderType folder.Type) (*folder.Folder, error) {
+	// Get account to check mappings
+	acc, err := a.accountStore.Get(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get account: %w", err)
+	}
+	if acc == nil {
+		return nil, fmt.Errorf("account not found: %s", accountID)
+	}
+
+	// Check if account has a manual mapping
+	mappedPath := acc.GetFolderMapping(string(folderType))
+	if mappedPath != "" {
+		f, err := a.folderStore.GetByPath(accountID, mappedPath)
+		if err != nil {
+			return nil, err
+		}
+		if f != nil {
+			return f, nil
+		}
+		// Mapped folder not found, fall through to auto-detect
+	}
+
+	// Fall back to auto-detected type
+	return a.folderStore.GetByType(accountID, folderType)
+}
+
+// ============================================================================
+// Message API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// GetMessages returns messages for a folder with pagination
+func (a *App) GetMessages(accountID, folderID string, offset, limit int) ([]*message.MessageHeader, error) {
+	return a.messageStore.ListByFolder(folderID, offset, limit)
+}
+
+// GetMessageCount returns the total message count for a folder
+func (a *App) GetMessageCount(accountID, folderID string) (int, error) {
+	return a.messageStore.CountByFolder(folderID)
+}
+
+// GetMessage returns a full message by ID
+func (a *App) GetMessage(id string) (*message.Message, error) {
+	return a.messageStore.Get(id)
+}
+
+// GetMessageSource fetches the raw RFC822 source of a message from the IMAP server
+func (a *App) GetMessageSource(messageID string) (string, error) {
+	log := logging.WithComponent("app")
+	log.Debug().Str("messageID", messageID).Msg("Fetching message source")
+
+	// Get the message to find the account, folder, and UID
+	msg, err := a.messageStore.Get(messageID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get message: %w", err)
+	}
+	if msg == nil {
+		return "", fmt.Errorf("message not found: %s", messageID)
+	}
+
+	// Fetch raw message from IMAP
+	rawBytes, err := a.syncEngine.FetchRawMessage(a.ctx, msg.AccountID, msg.FolderID, msg.UID)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch message source: %w", err)
+	}
+
+	return string(rawBytes), nil
+}
+
+// FetchMessageBody fetches the body for a message on-demand.
+// This is called when a message's body hasn't been fetched yet (BodyFetched = false).
+// It fetches the body from IMAP, updates the database, and returns the updated message.
+func (a *App) FetchMessageBody(messageID string) (*message.Message, error) {
+	log := logging.WithComponent("app")
+	log.Debug().Str("messageID", messageID).Msg("Fetching message body on-demand")
+
+	// Get the message first to get the account ID
+	msg, err := a.messageStore.Get(messageID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get message: %w", err)
+	}
+	if msg == nil {
+		return nil, fmt.Errorf("message not found: %s", messageID)
+	}
+
+	// If body is already fetched, just return it
+	if msg.BodyFetched {
+		return msg, nil
+	}
+
+	// Fetch the body from IMAP
+	updatedMsg, err := a.syncEngine.FetchMessageBody(a.ctx, msg.AccountID, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch message body: %w", err)
+	}
+
+	// Emit event so frontend knows the body is ready
+	wailsRuntime.EventsEmit(a.ctx, "message:bodyFetched", map[string]interface{}{
+		"messageId": messageID,
+	})
+
+	return updatedMsg, nil
+}
+
+// GetConversations returns conversations (threaded messages) for a folder with pagination
+// sortOrder can be "newest" (default) or "oldest"
+func (a *App) GetConversations(accountID, folderID string, offset, limit int, sortOrder string) ([]*message.Conversation, error) {
+	return a.messageStore.ListConversationsByFolder(folderID, offset, limit, sortOrder)
+}
+
+// GetConversationCount returns the total conversation count for a folder
+func (a *App) GetConversationCount(accountID, folderID string) (int, error) {
+	return a.messageStore.CountConversationsByFolder(folderID)
+}
+
+// GetUnifiedInboxConversations returns conversations from all inbox folders across all accounts
+func (a *App) GetUnifiedInboxConversations(offset, limit int, sortOrder string) ([]*message.Conversation, error) {
+	return a.messageStore.ListConversationsUnifiedInbox(offset, limit, sortOrder)
+}
+
+// GetUnifiedInboxCount returns the total conversation count across all inbox folders
+func (a *App) GetUnifiedInboxCount() (int, error) {
+	return a.messageStore.CountConversationsUnifiedInbox()
+}
+
+// GetUnifiedInboxUnreadCount returns the total unread count across all inbox folders
+func (a *App) GetUnifiedInboxUnreadCount() (int, error) {
+	return a.messageStore.GetUnifiedInboxUnreadCount()
+}
+
+// GetConversation returns all messages in a conversation/thread
+func (a *App) GetConversation(threadID, folderID string) (*message.Conversation, error) {
+	log := logging.WithComponent("app")
+	log.Debug().
+		Str("threadID", threadID).
+		Str("folderID", folderID).
+		Msg("GetConversation called")
+
+	conv, err := a.messageStore.GetConversation(threadID, folderID)
+	if err != nil {
+		log.Error().Err(err).Msg("GetConversation failed")
+		return nil, err
+	}
+
+	if conv != nil && conv.Messages != nil {
+		for i, m := range conv.Messages {
+			log.Debug().
+				Int("index", i).
+				Str("messageID", m.ID).
+				Str("subject", m.Subject).
+				Int("bodyTextLen", len(m.BodyText)).
+				Int("bodyHTMLLen", len(m.BodyHTML)).
+				Str("threadID", m.ThreadID).
+				Msg("GetConversation message")
+		}
+	} else {
+		log.Debug().Msg("GetConversation returned nil or no messages")
+	}
+
+	return conv, nil
+}
+
+// SearchConversations searches for conversations in a folder using full-text search
+// Returns matching conversations with highlighted text
+func (a *App) SearchConversations(accountID, folderID, query string, offset, limit int) ([]*message.ConversationSearchResult, error) {
+	results, _, err := a.messageStore.SearchConversations(folderID, query, offset, limit)
+	return results, err
+}
+
+// GetSearchCount returns the total count of search results in a folder
+func (a *App) GetSearchCount(accountID, folderID, query string) (int, error) {
+	_, count, err := a.messageStore.SearchConversations(folderID, query, 0, 0)
+	return count, err
+}
+
+// SearchUnifiedInbox searches across all inbox folders for all accounts
+func (a *App) SearchUnifiedInbox(query string, offset, limit int) ([]*message.ConversationSearchResult, error) {
+	results, _, err := a.messageStore.SearchConversationsUnifiedInbox(query, offset, limit)
+	return results, err
+}
+
+// GetSearchCountUnifiedInbox returns the total count of search results across all inboxes
+func (a *App) GetSearchCountUnifiedInbox(query string) (int, error) {
+	_, count, err := a.messageStore.SearchConversationsUnifiedInbox(query, 0, 0)
+	return count, err
+}
+
+// GetFTSIndexStatus returns the indexing status for a specific folder
+func (a *App) GetFTSIndexStatus(folderID string) (*message.FTSIndexStatus, error) {
+	return a.ftsIndexer.GetIndexStatus(folderID)
+}
+
+// GetFTSIndexStatusAll returns the indexing status for all folders
+func (a *App) GetFTSIndexStatusAll() (map[string]*message.FTSIndexStatus, error) {
+	return a.ftsIndexer.GetAllIndexStatuses()
+}
+
+// IsFTSIndexComplete checks if a folder is fully indexed
+func (a *App) IsFTSIndexComplete(folderID string) bool {
+	return a.ftsIndexer.IsIndexComplete(folderID)
+}
+
+// IsFTSIndexing returns true if any folder is currently being indexed
+func (a *App) IsFTSIndexing() bool {
+	return a.ftsIndexer.IsAnyIndexing()
+}
+
+// RebuildFTSIndex forces a rebuild of the FTS index for a folder
+func (a *App) RebuildFTSIndex(folderID string) error {
+	return a.ftsIndexer.RebuildIndex(a.ctx, folderID)
+}
+
+// SyncFolder synchronizes messages for a folder with the IMAP server
+func (a *App) SyncFolder(accountID, folderID string) error {
+	const debounceMs = 500
+	log := logging.WithComponent("app")
+
+	a.syncMu.Lock()
+
+	// Check debounce - if last request was within 500ms, skip
+	if lastReq, exists := a.syncLastRequest[accountID]; exists {
+		if time.Since(lastReq) < time.Duration(debounceMs)*time.Millisecond {
+			a.syncMu.Unlock()
+			log.Debug().Str("account", accountID).Msg("Sync request debounced")
+			return nil // Silently ignore
+		}
+	}
+	a.syncLastRequest[accountID] = time.Now()
+
+	// Cancel existing sync for this account if any
+	if cancel, exists := a.syncContexts[accountID]; exists {
+		log.Debug().Str("account", accountID).Msg("Cancelling existing sync for restart")
+		cancel()
+		// Small delay to let goroutines clean up
+		a.syncMu.Unlock()
+		time.Sleep(100 * time.Millisecond)
+		a.syncMu.Lock()
+	}
+
+	// Create new cancellable context for this sync
+	ctx, cancel := context.WithCancel(a.ctx)
+	a.syncContexts[accountID] = cancel
+
+	a.syncMu.Unlock()
+
+	// Ensure cleanup on completion (success, error, or cancellation)
+	defer func() {
+		a.syncMu.Lock()
+		delete(a.syncContexts, accountID)
+		a.syncMu.Unlock()
+	}()
+
+	// Get account to determine sync period
+	acc, err := a.accountStore.Get(accountID)
+	if err != nil {
+		return fmt.Errorf("failed to get account: %w", err)
+	}
+	syncPeriodDays := 30 // default (0 means all messages)
+	if acc != nil {
+		syncPeriodDays = acc.SyncPeriodDays
+	}
+
+	// Use ctx (not a.ctx) for sync operations so they can be cancelled
+	err = a.syncEngine.SyncMessages(ctx, accountID, folderID, syncPeriodDays)
+	if err != nil {
+		// Check if this was a cancellation
+		if ctx.Err() != nil {
+			log.Debug().Str("account", accountID).Str("folder", folderID).Msg("Sync cancelled")
+			return ctx.Err()
+		}
+		// Actual error - emit error event
+		log.Error().Err(err).Str("folder", folderID).Msg("Header sync failed")
+		wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+			"accountId": accountID,
+			"folderId":  folderID,
+			"error":     err.Error(),
+		})
+		return err
+	}
+
+	// Checkpoint WAL after heavy sync operation
+	if checkpointErr := a.db.Checkpoint(); checkpointErr != nil {
+		log.Warn().Err(checkpointErr).Msg("WAL checkpoint after SyncFolder failed")
+	}
+
+	// Emit folder count change event so frontend updates sidebar
+	if folder, folderErr := a.folderStore.Get(folderID); folderErr == nil && folder != nil {
+		log.Debug().
+			Str("folderID", folderID).
+			Int("unreadCount", folder.UnreadCount).
+			Msg("Emitting folders:countsChanged after sync")
+		wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", map[string]int{
+			folderID: folder.UnreadCount,
+		})
+	}
+
+	// Start background body fetching (emits progress events for "bodies" phase)
+	// Pass ctx so body fetch can also be cancelled
+	go func(syncCtx context.Context, syncDays int) {
+		bodyErr := a.syncEngine.FetchBodiesInBackground(syncCtx, accountID, folderID, syncDays)
+
+		if bodyErr != nil {
+			if syncCtx.Err() != nil {
+				// Cancelled - not an error, still emit synced so spinner stops
+				log.Debug().Str("folder", folderID).Msg("Background body fetch cancelled")
+				wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+					"accountId": accountID,
+					"folderId":  folderID,
+				})
+			} else {
+				// Actual error - emit error event instead of synced
+				log.Error().Err(bodyErr).Str("folder", folderID).Msg("Background body fetch failed")
+				wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+					"accountId": accountID,
+					"folderId":  folderID,
+					"error":     bodyErr.Error(),
+				})
+			}
+		} else {
+			// Success
+			wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+				"accountId": accountID,
+				"folderId":  folderID,
+			})
+		}
+	}(ctx, syncPeriodDays)
+
+	return nil
+}
+
+// ForceSyncFolder clears body content and attachments for a folder, then re-syncs.
+// This is useful when attachments weren't extracted properly (e.g., after a fix)
+// or when message content needs to be re-parsed.
+func (a *App) ForceSyncFolder(accountID, folderID string) error {
+	log := logging.WithComponent("app")
+	log.Info().Str("accountID", accountID).Str("folderID", folderID).Msg("Starting force re-sync of folder")
+
+	// Step 1: Clear body content for all messages in the folder
+	bodiesCleared, err := a.messageStore.ClearBodiesForFolder(folderID)
+	if err != nil {
+		return fmt.Errorf("failed to clear bodies: %w", err)
+	}
+	log.Info().Int64("bodiesCleared", bodiesCleared).Msg("Cleared message bodies")
+
+	// Step 2: Delete attachments for all messages in the folder
+	attachmentsDeleted, err := a.attachmentStore.DeleteAttachmentsForFolder(folderID)
+	if err != nil {
+		return fmt.Errorf("failed to delete attachments: %w", err)
+	}
+	log.Info().Int64("attachmentsDeleted", attachmentsDeleted).Msg("Deleted attachments")
+
+	// Step 3: Trigger normal folder sync (which will re-fetch bodies and extract attachments)
+	return a.SyncFolder(accountID, folderID)
+}
+
+// SyncAccountComplete performs a comprehensive sync of an account:
+// 1. Syncs folder list from IMAP
+// 2. Syncs core folders' messages (Inbox, Drafts, Sent)
+func (a *App) SyncAccountComplete(accountID string) error {
+	log := logging.WithComponent("app.masterSync")
+	log.Info().Str("accountID", accountID).Msg("Starting complete account sync")
+
+	// 1. Sync folder list first (required for message sync)
+	if err := a.SyncFolders(accountID); err != nil {
+		return fmt.Errorf("folder sync failed: %w", err)
+	}
+
+	// 2. Sync core folders in order of importance
+	coreFolderTypes := []folder.Type{
+		folder.TypeInbox,
+		folder.TypeDrafts,
+		folder.TypeSent,
+	}
+
+	var syncErrors []string
+	for _, folderType := range coreFolderTypes {
+		log.Debug().Str("type", string(folderType)).Msg("Looking for special folder")
+		f, err := a.GetSpecialFolder(accountID, folderType)
+		if err != nil {
+			log.Warn().Err(err).Str("type", string(folderType)).Msg("Failed to get folder")
+			syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", folderType, err))
+			continue
+		}
+		if f == nil {
+			log.Warn().Str("type", string(folderType)).Msg("Folder not found, skipping")
+			continue
+		}
+
+		log.Info().Str("type", string(folderType)).Str("path", f.Path).Str("id", f.ID).Msg("Found special folder, syncing")
+		if err := a.SyncFolder(accountID, f.ID); err != nil {
+			log.Warn().Err(err).Str("folder", f.Path).Msg("Message sync failed")
+			syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", f.Path, err))
+		}
+	}
+
+	if len(syncErrors) > 0 {
+		return fmt.Errorf("some folders failed to sync: %s", strings.Join(syncErrors, "; "))
+	}
+
+	log.Info().Str("accountID", accountID).Msg("Complete account sync finished")
+	return nil
+}
+
+// SyncAllComplete syncs all accounts completely, then syncs CardDAV sources.
+// Email sync runs first (most important), then CardDAV sync runs after to avoid
+// database contention (SQLITE_BUSY errors).
+// This is the master sync function called from the sidebar sync button.
+func (a *App) SyncAllComplete() error {
+	log := logging.WithComponent("app.masterSync")
+	log.Info().Msg("Starting complete sync of all accounts and contacts")
+
+	accounts, err := a.accountStore.List()
+	if err != nil {
+		return fmt.Errorf("failed to list accounts: %w", err)
+	}
+
+	var errors []string
+
+	// First: Sync each email account (sequentially to avoid overwhelming IMAP)
+	// Email sync is the primary use case and runs without database contention
+	for _, acc := range accounts {
+		if !acc.Enabled {
+			continue
+		}
+		if err := a.SyncAccountComplete(acc.ID); err != nil {
+			errors = append(errors, fmt.Sprintf("%s: %v", acc.Email, err))
+			// Continue with other accounts
+		}
+	}
+
+	// Then: Sync CardDAV contacts (after email sync completes)
+	// This avoids SQLITE_BUSY errors from concurrent writes
+	if err := a.SyncAllContactSources(); err != nil {
+		errors = append(errors, fmt.Sprintf("contacts: %v", err))
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("sync errors: %s", strings.Join(errors, "; "))
+	}
+
+	log.Info().Msg("Complete sync of all accounts and contacts finished")
+	return nil
+}
+
+// CancelAccountSync cancels any running sync for the specified account
+func (a *App) CancelAccountSync(accountID string) {
+	log := logging.WithComponent("app")
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+
+	if cancel, exists := a.syncContexts[accountID]; exists {
+		log.Info().Str("accountID", accountID).Msg("Cancelling account sync")
+		cancel()
+		delete(a.syncContexts, accountID)
+	}
+}
+
+// CancelAllSyncs cancels all running syncs
+func (a *App) CancelAllSyncs() {
+	log := logging.WithComponent("app")
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+
+	for accountID, cancel := range a.syncContexts {
+		log.Info().Str("accountID", accountID).Msg("Cancelling sync")
+		cancel()
+	}
+	a.syncContexts = make(map[string]context.CancelFunc)
+}
+
+// ============================================================================
+// Attachment API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// GetAttachments returns all attachments for a message
+func (a *App) GetAttachments(messageID string) ([]*message.Attachment, error) {
+	return a.attachmentStore.GetByMessage(messageID)
+}
+
+// GetAttachment returns a single attachment by ID
+func (a *App) GetAttachment(attachmentID string) (*message.Attachment, error) {
+	return a.attachmentStore.Get(attachmentID)
+}
+
+// GetInlineAttachments returns a map of content-id to data URL for all inline attachments
+// This is used to resolve cid: references in HTML email bodies
+// Content is read from the database (stored during sync) for fast offline access
+func (a *App) GetInlineAttachments(messageID string) (map[string]string, error) {
+	log := logging.WithComponent("app")
+
+	log.Info().Str("messageID", messageID).Msg("GetInlineAttachments called")
+
+	// Get inline attachments with content from database
+	// This is fast and works offline since content is stored during sync
+	result, err := a.attachmentStore.GetInlineByMessage(messageID)
+	if err != nil {
+		log.Error().Err(err).Str("messageID", messageID).Msg("Failed to get inline attachments from database")
+		return nil, fmt.Errorf("failed to get inline attachments: %w", err)
+	}
+
+	// Log the content IDs we found
+	contentIDs := make([]string, 0, len(result))
+	for cid := range result {
+		contentIDs = append(contentIDs, cid)
+	}
+	log.Info().Int("count", len(result)).Strs("contentIDs", contentIDs).Str("messageID", messageID).Msg("Returning inline attachments")
+
+	return result, nil
+}
+
+// DownloadAttachment downloads an attachment and saves it to disk
+// If savePath is empty, saves to the default attachments directory
+// Returns the path where the file was saved
+func (a *App) DownloadAttachment(attachmentID, savePath string) (string, error) {
+	log := logging.WithComponent("app")
+
+	log.Debug().Str("attachmentID", attachmentID).Str("savePath", savePath).Msg("DownloadAttachment called")
+
+	// Get attachment metadata
+	att, err := a.attachmentStore.Get(attachmentID)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to get attachment from store")
+		return "", fmt.Errorf("failed to get attachment: %w", err)
+	}
+	if att == nil {
+		log.Error().Str("attachmentID", attachmentID).Msg("Attachment not found")
+		return "", fmt.Errorf("attachment not found: %s", attachmentID)
+	}
+
+	log.Debug().Str("filename", att.Filename).Int("size", att.Size).Msg("Got attachment metadata")
+
+	// Check if already downloaded (only for default location, not custom paths)
+	if savePath == "" && att.LocalPath != "" {
+		if _, err := os.Stat(att.LocalPath); err == nil {
+			log.Debug().Str("localPath", att.LocalPath).Msg("Attachment already downloaded")
+			return att.LocalPath, nil
+		}
+	}
+
+	// Get the message to find folder and UID
+	msg, err := a.messageStore.Get(att.MessageID)
+	if err != nil {
+		log.Error().Err(err).Str("messageID", att.MessageID).Msg("Failed to get message")
+		return "", fmt.Errorf("failed to get message: %w", err)
+	}
+	if msg == nil {
+		log.Error().Str("messageID", att.MessageID).Msg("Message not found")
+		return "", fmt.Errorf("message not found: %s", att.MessageID)
+	}
+
+	log.Debug().Uint32("uid", msg.UID).Str("folderID", msg.FolderID).Msg("Got message info")
+
+	// Fetch raw message from IMAP
+	raw, err := a.syncEngine.FetchRawMessage(a.ctx, msg.AccountID, msg.FolderID, msg.UID)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to fetch raw message from IMAP")
+		return "", fmt.Errorf("failed to fetch message: %w", err)
+	}
+
+	log.Debug().Int("rawSize", len(raw)).Msg("Fetched raw message from IMAP")
+
+	// Extract attachment content
+	downloader := email.NewAttachmentDownloader(a.paths.AttachmentsPath())
+	content, err := downloader.ExtractAttachmentContent(raw, att.Filename)
+	if err != nil {
+		log.Error().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment content")
+		return "", fmt.Errorf("failed to extract attachment: %w", err)
+	}
+
+	log.Debug().Int("contentSize", len(content)).Msg("Extracted attachment content")
+
+	// Save to disk
+	localPath, err := downloader.SaveAttachment(att, content, savePath)
+	if err != nil {
+		log.Error().Err(err).Str("savePath", savePath).Msg("Failed to save attachment to disk")
+		return "", fmt.Errorf("failed to save attachment: %w", err)
+	}
+
+	// Update attachment record with local path (only for default location)
+	if savePath == "" {
+		if err := a.attachmentStore.UpdateLocalPath(attachmentID, localPath); err != nil {
+			log.Warn().Err(err).Msg("Failed to update attachment local path")
+		}
+	}
+
+	log.Info().Str("attachment", att.Filename).Str("path", localPath).Int("size", len(content)).Msg("Attachment downloaded")
+	return localPath, nil
+}
+
+// OpenAttachment downloads (if needed) and opens an attachment with the default application
+func (a *App) OpenAttachment(attachmentID string) error {
+	// Download if not already downloaded
+	localPath, err := a.DownloadAttachment(attachmentID, "")
+	if err != nil {
+		return err
+	}
+
+	// Open with default application using runtime
+	return a.openFile(localPath)
+}
+
+// SaveAttachmentAs shows a Save As dialog and saves the attachment to the user-selected location
+// Returns the path where the file was saved, or empty string if cancelled
+func (a *App) SaveAttachmentAs(attachmentID string) (string, error) {
+	log := logging.WithComponent("app")
+
+	log.Debug().Str("attachmentID", attachmentID).Msg("SaveAttachmentAs called")
+
+	// Get attachment metadata for the filename
+	att, err := a.attachmentStore.Get(attachmentID)
+	if err != nil {
+		log.Error().Err(err).Str("attachmentID", attachmentID).Msg("Failed to get attachment metadata")
+		return "", fmt.Errorf("failed to get attachment: %w", err)
+	}
+	if att == nil {
+		log.Error().Str("attachmentID", attachmentID).Msg("Attachment not found in database")
+		return "", fmt.Errorf("attachment not found: %s", attachmentID)
+	}
+
+	log.Debug().Str("filename", att.Filename).Str("messageID", att.MessageID).Msg("Found attachment metadata")
+
+	// Get user's home directory for default save location
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = ""
+	}
+	defaultDir := filepath.Join(homeDir, "Downloads")
+
+	// Show Save As dialog
+	savePath, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
+		DefaultDirectory: defaultDir,
+		DefaultFilename:  att.Filename,
+		Title:            "Save Attachment",
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to show save dialog")
+		return "", fmt.Errorf("failed to show save dialog: %w", err)
+	}
+
+	log.Debug().Str("savePath", savePath).Msg("User selected save path")
+
+	// User cancelled the dialog
+	if savePath == "" {
+		log.Debug().Msg("User cancelled save dialog")
+		return "", nil
+	}
+
+	// Download and save to the selected path
+	resultPath, err := a.DownloadAttachment(attachmentID, savePath)
+	if err != nil {
+		log.Error().Err(err).Str("savePath", savePath).Msg("Failed to download attachment")
+		return "", err
+	}
+
+	log.Info().Str("attachment", att.Filename).Str("path", resultPath).Msg("Attachment saved")
+	return resultPath, nil
+}
+
+// openFile opens a file with the system default application
+func (a *App) openFile(path string) error {
+	var cmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "linux":
+		cmd = exec.Command("xdg-open", path)
+	case "darwin":
+		cmd = exec.Command("open", path)
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", "", path)
+	default:
+		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+
+	return cmd.Start()
+}
+
+// OpenFile opens a file with the system default application (exposed to frontend)
+func (a *App) OpenFile(path string) error {
+	return a.openFile(path)
+}
+
+// OpenFolder opens the folder containing a file in the system file manager
+func (a *App) OpenFolder(path string) error {
+	dir := filepath.Dir(path)
+	var cmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "linux":
+		// Try to select the file in the file manager if possible
+		cmd = exec.Command("xdg-open", dir)
+	case "darwin":
+		// -R reveals the file in Finder
+		cmd = exec.Command("open", "-R", path)
+	case "windows":
+		// /select highlights the file in Explorer
+		cmd = exec.Command("explorer", "/select,", path)
+	default:
+		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+
+	return cmd.Start()
+}
+
+// SaveAllAttachments shows a folder picker and saves all attachments from a message to that folder
+// Returns the folder path where files were saved, or empty string if cancelled
+func (a *App) SaveAllAttachments(messageID string) (string, error) {
+	log := logging.WithComponent("app")
+
+	// Get all attachments for the message
+	attachments, err := a.attachmentStore.GetByMessage(messageID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get attachments: %w", err)
+	}
+	if len(attachments) == 0 {
+		return "", fmt.Errorf("no attachments found for message")
+	}
+
+	// Get user's home directory for default save location
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = ""
+	}
+	defaultDir := filepath.Join(homeDir, "Downloads")
+
+	// Show folder picker dialog
+	saveDir, err := wailsRuntime.OpenDirectoryDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		DefaultDirectory: defaultDir,
+		Title:            "Save All Attachments",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to show folder dialog: %w", err)
+	}
+
+	// User cancelled the dialog
+	if saveDir == "" {
+		return "", nil
+	}
+
+	// Get the message to find folder and UID
+	msg, err := a.messageStore.Get(messageID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get message: %w", err)
+	}
+	if msg == nil {
+		return "", fmt.Errorf("message not found: %s", messageID)
+	}
+
+	// Fetch raw message from IMAP
+	raw, err := a.syncEngine.FetchRawMessage(a.ctx, msg.AccountID, msg.FolderID, msg.UID)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch message: %w", err)
+	}
+
+	// Save each attachment
+	downloader := email.NewAttachmentDownloader(a.paths.AttachmentsPath())
+	savedCount := 0
+
+	for _, att := range attachments {
+		content, err := downloader.ExtractAttachmentContent(raw, att.Filename)
+		if err != nil {
+			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to extract attachment")
+			continue
+		}
+
+		savePath := filepath.Join(saveDir, att.Filename)
+		_, err = downloader.SaveAttachment(att, content, savePath)
+		if err != nil {
+			log.Warn().Err(err).Str("filename", att.Filename).Msg("Failed to save attachment")
+			continue
+		}
+		savedCount++
+	}
+
+	log.Info().Int("count", savedCount).Str("folder", saveDir).Msg("Saved all attachments")
+	return saveDir, nil
+}
+
+// ============================================================================
+// Connection Testing
+// ============================================================================
+
+// TestConnection tests the IMAP/SMTP connection for an account config
+// For OAuth2 accounts, this only tests connectivity (no login) since the user
+// hasn't authenticated yet during account creation.
+func (a *App) TestConnection(config account.AccountConfig) error {
+	log := logging.WithComponent("app")
+
+	// Validate config first
+	if err := config.Validate(); err != nil {
+		return err
+	}
+
+	// For OAuth2 accounts, skip login test during account creation
+	// The actual authentication will happen during the OAuth flow
+	if config.AuthType == account.AuthOAuth2 {
+		log.Info().
+			Str("host", config.IMAPHost).
+			Str("authType", string(config.AuthType)).
+			Msg("Skipping connection test for OAuth2 account (will test after authorization)")
+		return nil
+	}
+
+	// Create a temporary IMAP client to test connection
+	clientConfig := imap.DefaultConfig()
+	clientConfig.Host = config.IMAPHost
+	clientConfig.Port = config.IMAPPort
+	clientConfig.Security = imap.SecurityType(config.IMAPSecurity)
+	clientConfig.Username = config.Username
+	clientConfig.Password = config.Password
+	clientConfig.AuthType = imap.AuthTypePassword
+
+	client := imap.NewClient(clientConfig)
+
+	if err := client.Connect(); err != nil {
+		log.Error().Err(err).Msg("Connection test failed")
+		return fmt.Errorf("failed to connect: %w", err)
+	}
+	defer client.Close()
+
+	if err := client.Login(); err != nil {
+		log.Error().Err(err).Msg("Login test failed")
+		return fmt.Errorf("failed to login: %w", err)
+	}
+
+	log.Info().Str("host", config.IMAPHost).Msg("Connection test successful")
+	return nil
+}
+
+// ============================================================================
+// SMTP / Send API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// SendMessage sends an email message
+func (a *App) SendMessage(accountID string, msg smtp.ComposeMessage) error {
+	log := logging.WithComponent("app")
+
+	log.Info().
+		Str("account_id", accountID).
+		Str("from", msg.From.Address).
+		Int("to_count", len(msg.To)).
+		Str("subject", msg.Subject).
+		Msg("Sending message")
+
+	// Get account for SMTP settings
+	acc, err := a.accountStore.Get(accountID)
+	if err != nil {
+		return fmt.Errorf("failed to get account: %w", err)
+	}
+	if acc == nil {
+		return fmt.Errorf("account not found: %s", accountID)
+	}
+
+	// Build RFC822 message
+	rawMsg, err := msg.ToRFC822()
+	if err != nil {
+		return fmt.Errorf("failed to build message: %w", err)
+	}
+
+	// Create SMTP client config
+	smtpConfig := smtp.DefaultConfig()
+	smtpConfig.Host = acc.SMTPHost
+	smtpConfig.Port = acc.SMTPPort
+	smtpConfig.Security = smtp.SecurityType(acc.SMTPSecurity)
+	smtpConfig.Username = acc.Username
+
+	// Handle authentication based on auth type
+	if acc.AuthType == account.AuthOAuth2 {
+		// Get valid OAuth token (refreshing if needed)
+		tokens, err := a.getValidOAuthToken(accountID)
+		if err != nil {
+			return fmt.Errorf("failed to get OAuth token: %w", err)
+		}
+		smtpConfig.AuthType = smtp.AuthTypeOAuth2
+		smtpConfig.AccessToken = tokens.AccessToken
+	} else {
+		// Default to password authentication
+		password, err := a.credStore.GetPassword(accountID)
+		if err != nil {
+			return fmt.Errorf("failed to get password: %w", err)
+		}
+		smtpConfig.AuthType = smtp.AuthTypePassword
+		smtpConfig.Password = password
+	}
+
+	client := smtp.NewClient(smtpConfig)
+
+	// Connect and authenticate
+	if err := client.Connect(); err != nil {
+		return fmt.Errorf("failed to connect to SMTP server: %w", err)
+	}
+	defer client.Close()
+
+	if err := client.Login(); err != nil {
+		return fmt.Errorf("failed to authenticate with SMTP server: %w", err)
+	}
+
+	// Send the message
+	recipients := msg.AllRecipients()
+	if len(recipients) == 0 {
+		return fmt.Errorf("no recipients specified")
+	}
+
+	if err := client.SendMail(msg.From.Address, recipients, rawMsg); err != nil {
+		return fmt.Errorf("failed to send message: %w", err)
+	}
+
+	// Handle Sent folder: either APPEND (for providers that don't auto-save) or just sync
+	go func() {
+		if providerAutoSavesSentMail(acc.IMAPHost) {
+			// Provider auto-saves sent mail, just sync to pick it up
+			log.Debug().Str("host", acc.IMAPHost).Msg("Provider auto-saves sent mail, syncing Sent folder")
+			if err := a.syncSentFolder(accountID); err != nil {
+				log.Warn().Err(err).Msg("Failed to sync Sent folder after sending")
+			}
+		} else {
+			// Provider doesn't auto-save, APPEND to Sent folder then sync
+			log.Debug().Str("host", acc.IMAPHost).Msg("Provider doesn't auto-save, using IMAP APPEND")
+			if err := a.saveToSentFolder(acc, rawMsg); err != nil {
+				log.Warn().Err(err).Msg("Failed to save message to Sent folder")
+			}
+			if err := a.syncSentFolder(accountID); err != nil {
+				log.Warn().Err(err).Msg("Failed to sync Sent folder after sending")
+			}
+		}
+	}()
+
+	// Add recipients to contacts for future autocomplete
+	for _, to := range msg.To {
+		a.contactStore.AddOrUpdate(to.Address, to.Name)
+	}
+	for _, cc := range msg.Cc {
+		a.contactStore.AddOrUpdate(cc.Address, cc.Name)
+	}
+	// Note: BCC recipients are also added for autocomplete
+	for _, bcc := range msg.Bcc {
+		a.contactStore.AddOrUpdate(bcc.Address, bcc.Name)
+	}
+
+	log.Info().
+		Str("account_id", accountID).
+		Int("recipients", len(recipients)).
+		Msg("Message sent successfully")
+
+	return nil
+}
+
+// syncSentFolder syncs the Sent folder to pick up newly sent messages
+func (a *App) syncSentFolder(accountID string) error {
+	log := logging.WithComponent("app")
+
+	// Get the Sent folder
+	sentFolder, err := a.folderStore.GetByType(accountID, folder.TypeSent)
+	if err != nil || sentFolder == nil {
+		return fmt.Errorf("no Sent folder found for account")
+	}
+
+	log.Debug().
+		Str("account_id", accountID).
+		Str("folder_id", sentFolder.ID).
+		Str("folder_path", sentFolder.Path).
+		Msg("Syncing Sent folder after send")
+
+	// Trigger folder sync
+	return a.SyncFolder(accountID, sentFolder.ID)
+}
+
+// providerAutoSavesSentMail returns true if the provider automatically saves
+// sent messages to the Sent folder (so we don't need to IMAP APPEND).
+// Known auto-save providers: Gmail, Outlook.com, Office365, iCloud, Yahoo
+func providerAutoSavesSentMail(imapHost string) bool {
+	host := strings.ToLower(imapHost)
+
+	autoSaveHosts := []string{
+		"imap.gmail.com",
+		"imap.googlemail.com",
+		"outlook.office365.com",
+		"imap-mail.outlook.com",
+		"imap.mail.me.com",      // iCloud
+		"imap.yahoo.com",
+		"imap.aol.com",
+		"imap.zoho.com",
+		"imap.fastmail.com",
+	}
+
+	for _, h := range autoSaveHosts {
+		if host == h {
+			return true
+		}
+	}
+	return false
+}
+
+// saveToSentFolder appends the sent message to the Sent folder via IMAP.
+// Used for providers that don't automatically save sent messages.
+func (a *App) saveToSentFolder(acc *account.Account, rawMsg []byte) error {
+	log := logging.WithComponent("app")
+
+	// Get the Sent folder path
+	sentFolder, err := a.folderStore.GetByType(acc.ID, folder.TypeSent)
+	if err != nil || sentFolder == nil {
+		// Try account's configured sent folder path
+		if acc.SentFolderPath == "" {
+			return fmt.Errorf("no Sent folder configured or detected")
+		}
+	}
+
+	sentPath := acc.SentFolderPath
+	if sentPath == "" && sentFolder != nil {
+		sentPath = sentFolder.Path
+	}
+
+	log.Debug().
+		Str("account_id", acc.ID).
+		Str("sent_path", sentPath).
+		Msg("Saving sent message to folder via IMAP APPEND")
+
+	// Create IMAP client
+	clientConfig := imap.DefaultConfig()
+	clientConfig.Host = acc.IMAPHost
+	clientConfig.Port = acc.IMAPPort
+	clientConfig.Security = imap.SecurityType(acc.IMAPSecurity)
+	clientConfig.Username = acc.Username
+
+	// Handle authentication
+	if acc.AuthType == account.AuthOAuth2 {
+		tokens, err := a.getValidOAuthToken(acc.ID)
+		if err != nil {
+			return fmt.Errorf("failed to get OAuth token: %w", err)
+		}
+		clientConfig.AuthType = imap.AuthTypeOAuth2
+		clientConfig.AccessToken = tokens.AccessToken
+	} else {
+		password, err := a.credStore.GetPassword(acc.ID)
+		if err != nil {
+			return fmt.Errorf("failed to get password: %w", err)
+		}
+		clientConfig.AuthType = imap.AuthTypePassword
+		clientConfig.Password = password
+	}
+
+	imapClient := imap.NewClient(clientConfig)
+	if err := imapClient.Connect(); err != nil {
+		return fmt.Errorf("failed to connect to IMAP: %w", err)
+	}
+	defer imapClient.Close()
+
+	if err := imapClient.Login(); err != nil {
+		return fmt.Errorf("failed to login to IMAP: %w", err)
+	}
+
+	// Append message with \Seen flag (sent messages should be marked as read)
+	flags := []goImap.Flag{goImap.FlagSeen}
+	_, err = imapClient.AppendMessage(sentPath, flags, time.Now(), rawMsg)
+	if err != nil {
+		return fmt.Errorf("failed to append to Sent folder: %w", err)
+	}
+
+	log.Info().
+		Str("account_id", acc.ID).
+		Str("sent_path", sentPath).
+		Msg("Message saved to Sent folder")
+
+	return nil
+}
+
+// PrepareReply builds a ComposeMessage for reply/reply-all/forward
+func (a *App) PrepareReply(accountID string, messageID string, mode string) (*smtp.ComposeMessage, error) {
+	log := logging.WithComponent("app")
+
+	// Validate mode
+	if mode != "reply" && mode != "reply-all" && mode != "forward" {
+		return nil, fmt.Errorf("invalid mode: %s (must be reply, reply-all, or forward)", mode)
+	}
+
+	// Get original message
+	msg, err := a.messageStore.Get(messageID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get message: %w", err)
+	}
+	if msg == nil {
+		return nil, fmt.Errorf("message not found: %s", messageID)
+	}
+
+	// Get account identities for self-filtering and From address
+	identities, err := a.accountStore.GetIdentities(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identities: %w", err)
+	}
+	if len(identities) == 0 {
+		return nil, fmt.Errorf("no identities found for account: %s", accountID)
+	}
+
+	// Build set of self email addresses (lowercase for comparison)
+	selfEmails := make(map[string]bool)
+	for _, id := range identities {
+		selfEmails[toLowerEmail(id.Email)] = true
+	}
+
+	// Get default identity for From address
+	var fromIdentity *account.Identity
+	for _, id := range identities {
+		if id.IsDefault {
+			fromIdentity = id
+			break
+		}
+	}
+	if fromIdentity == nil {
+		fromIdentity = identities[0]
+	}
+
+	// Parse addresses from original message
+	originalFrom := parseAddressList(formatSenderAddress(msg.FromName, msg.FromEmail))
+	originalTo := parseAddressList(msg.ToList)
+	originalCc := parseAddressList(msg.CcList)
+	originalReplyTo := parseAddressList(msg.ReplyTo)
+
+	// Build recipient lists based on mode
+	var toRecipients, ccRecipients []smtp.Address
+
+	switch mode {
+	case "reply":
+		// Reply to Reply-To header if present, otherwise From
+		if len(originalReplyTo) > 0 {
+			toRecipients = filterSelfAddresses(originalReplyTo, selfEmails)
+		} else {
+			toRecipients = filterSelfAddresses(originalFrom, selfEmails)
+		}
+
+	case "reply-all":
+		// To: Reply-To (or From) + original To (excluding self)
+		if len(originalReplyTo) > 0 {
+			toRecipients = filterSelfAddresses(originalReplyTo, selfEmails)
+		} else {
+			toRecipients = filterSelfAddresses(originalFrom, selfEmails)
+		}
+		// Add original To recipients (excluding self)
+		filteredTo := filterSelfAddresses(originalTo, selfEmails)
+		toRecipients = append(toRecipients, filteredTo...)
+
+		// Cc: original Cc (excluding self and duplicates from To)
+		filteredCc := filterSelfAddresses(originalCc, selfEmails)
+		// Remove addresses already in To
+		toEmailSet := make(map[string]bool)
+		for _, addr := range toRecipients {
+			toEmailSet[toLowerEmail(addr.Address)] = true
+		}
+		for _, addr := range filteredCc {
+			if !toEmailSet[toLowerEmail(addr.Address)] {
+				ccRecipients = append(ccRecipients, addr)
+			}
+		}
+
+	case "forward":
+		// Forward: leave recipients empty for user to fill in
+		toRecipients = []smtp.Address{}
+		ccRecipients = []smtp.Address{}
+	}
+
+	// Build subject
+	subject := buildReplySubject(msg.Subject, mode)
+
+	// Build quoted body
+	htmlBody := buildQuotedHTML(msg, mode)
+	textBody := buildQuotedText(msg, mode)
+
+	// Build references for threading
+	references := buildReferences(msg)
+
+	// Create compose message
+	compose := &smtp.ComposeMessage{
+		From: smtp.Address{
+			Name:    fromIdentity.Name,
+			Address: fromIdentity.Email,
+		},
+		To:         toRecipients,
+		Cc:         ccRecipients,
+		Bcc:        []smtp.Address{},
+		Subject:    subject,
+		HTMLBody:   htmlBody,
+		TextBody:   textBody,
+		References: references,
+	}
+
+	// Set In-Reply-To for replies (not forwards)
+	if mode != "forward" && msg.MessageID != "" {
+		compose.InReplyTo = msg.MessageID
+	}
+
+	log.Info().
+		Str("mode", mode).
+		Str("messageID", messageID).
+		Int("toCount", len(toRecipients)).
+		Int("ccCount", len(ccRecipients)).
+		Msg("Prepared reply message")
+
+	return compose, nil
+}
+
+// parseAddressList parses an address list which may be:
+// 1. JSON array: [{"name":"...", "email":"..."}]
+// 2. Comma-separated: "Name <email>, Name2 <email2>" or just "email, email2"
+func parseAddressList(list string) []smtp.Address {
+	if list == "" {
+		return nil
+	}
+
+	list = trimWhitespace(list)
+
+	// Check if it's JSON format (starts with '[')
+	if len(list) > 0 && list[0] == '[' {
+		return parseAddressListJSON(list)
+	}
+
+	// Otherwise parse as comma-separated
+	var addresses []smtp.Address
+	parts := splitAddresses(list)
+
+	for _, part := range parts {
+		part = trimWhitespace(part)
+		if part == "" {
+			continue
+		}
+
+		addr := parseAddress(part)
+		if addr.Address != "" {
+			addresses = append(addresses, addr)
+		}
+	}
+
+	return addresses
+}
+
+// parseAddressListJSON parses a JSON array of addresses
+// Format: [{"name":"...", "email":"..."}]
+func parseAddressListJSON(jsonStr string) []smtp.Address {
+	type jsonAddr struct {
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	}
+
+	var jsonAddrs []jsonAddr
+	if err := json.Unmarshal([]byte(jsonStr), &jsonAddrs); err != nil {
+		// If JSON parsing fails, return empty
+		return nil
+	}
+
+	addresses := make([]smtp.Address, 0, len(jsonAddrs))
+	for _, ja := range jsonAddrs {
+		if ja.Email != "" {
+			addresses = append(addresses, smtp.Address{
+				Name:    ja.Name,
+				Address: ja.Email,
+			})
+		}
+	}
+
+	return addresses
+}
+
+// splitAddresses splits address list handling quotes
+func splitAddresses(list string) []string {
+	var result []string
+	var current string
+	inQuotes := false
+	inAngleBracket := false
+
+	for _, ch := range list {
+		switch ch {
+		case '"':
+			inQuotes = !inQuotes
+			current += string(ch)
+		case '<':
+			inAngleBracket = true
+			current += string(ch)
+		case '>':
+			inAngleBracket = false
+			current += string(ch)
+		case ',':
+			if !inQuotes && !inAngleBracket {
+				result = append(result, current)
+				current = ""
+			} else {
+				current += string(ch)
+			}
+		default:
+			current += string(ch)
+		}
+	}
+	if current != "" {
+		result = append(result, current)
+	}
+	return result
+}
+
+// parseAddress parses a single address like "Name <email>" or just "email"
+func parseAddress(s string) smtp.Address {
+	s = trimWhitespace(s)
+
+	// Try "Name <email>" format
+	if idx := findLastIndex(s, '<'); idx >= 0 {
+		if endIdx := findLastIndex(s, '>'); endIdx > idx {
+			name := trimWhitespace(s[:idx])
+			email := trimWhitespace(s[idx+1 : endIdx])
+			// Remove quotes from name
+			name = trimQuotes(name)
+			return smtp.Address{Name: name, Address: email}
+		}
+	}
+
+	// Plain email address
+	return smtp.Address{Name: "", Address: s}
+}
+
+// formatSenderAddress formats sender name and email into a single string
+func formatSenderAddress(name, email string) string {
+	if name == "" {
+		return email
+	}
+	return fmt.Sprintf("%s <%s>", name, email)
+}
+
+// filterSelfAddresses removes the user's own addresses from the list
+func filterSelfAddresses(addresses []smtp.Address, selfEmails map[string]bool) []smtp.Address {
+	var result []smtp.Address
+	for _, addr := range addresses {
+		if !selfEmails[toLowerEmail(addr.Address)] {
+			result = append(result, addr)
+		}
+	}
+	return result
+}
+
+// buildReplySubject adds Re: or Fwd: prefix, avoiding stacking
+func buildReplySubject(subject string, mode string) string {
+	subject = trimWhitespace(subject)
+
+	if mode == "forward" {
+		// Check if already has Fwd: prefix (case insensitive)
+		lower := toLower(subject)
+		if hasPrefix(lower, "fwd:") || hasPrefix(lower, "fw:") {
+			return subject
+		}
+		return "Fwd: " + subject
+	}
+
+	// Reply mode - check for Re: prefix
+	lower := toLower(subject)
+	if hasPrefix(lower, "re:") {
+		return subject
+	}
+	return "Re: " + subject
+}
+
+// buildQuotedHTML builds the quoted HTML body in Geary style
+func buildQuotedHTML(msg *message.Message, mode string) string {
+	// Format date like Geary: "Mon, Jan 2 2006 at 3:04:05 PM MST"
+	dateStr := msg.Date.Format("Mon, Jan 2 2006 at 3:04:05 PM MST")
+
+	// Get sender display
+	sender := msg.FromEmail
+	if msg.FromName != "" {
+		sender = msg.FromName + " <" + msg.FromEmail + ">"
+	}
+
+	// Get original body (prefer HTML)
+	originalBody := msg.BodyHTML
+	if originalBody == "" {
+		// Convert plain text to simple HTML
+		originalBody = "<pre>" + escapeHTML(msg.BodyText) + "</pre>"
+	}
+
+	if mode == "forward" {
+		// Forward format: header block + body (no blockquote)
+		var header string
+		header = "---------- Forwarded message ----------<br>\n"
+		header += "From: " + escapeHTML(sender) + "<br>\n"
+		header += "Subject: " + escapeHTML(msg.Subject) + "<br>\n"
+		header += "Date: " + escapeHTML(dateStr) + "<br>\n"
+		header += "To: " + escapeHTML(msg.ToList) + "<br>\n"
+		if msg.CcList != "" {
+			header += "Cc: " + escapeHTML(msg.CcList) + "<br>\n"
+		}
+		header += "<br>\n"
+
+		return "<br><br>\n" + header + originalBody
+	}
+
+	// Reply format: citation line + blockquote
+	citation := fmt.Sprintf("On %s, %s wrote:", dateStr, escapeHTML(sender))
+	return fmt.Sprintf("<br><br>\n%s<br>\n<blockquote type=\"cite\">\n%s\n</blockquote>", citation, originalBody)
+}
+
+// buildQuotedText builds the quoted plain text body
+func buildQuotedText(msg *message.Message, mode string) string {
+	// Format date
+	dateStr := msg.Date.Format("Mon, Jan 2 2006 at 3:04:05 PM MST")
+
+	// Get sender display
+	sender := msg.FromEmail
+	if msg.FromName != "" {
+		sender = msg.FromName + " <" + msg.FromEmail + ">"
+	}
+
+	// Get original body (prefer plain text)
+	originalBody := msg.BodyText
+	if originalBody == "" {
+		// Strip HTML tags for a basic conversion
+		originalBody = stripHTMLTags(msg.BodyHTML)
+	}
+
+	if mode == "forward" {
+		var header string
+		header = "---------- Forwarded message ----------\n"
+		header += "From: " + sender + "\n"
+		header += "Subject: " + msg.Subject + "\n"
+		header += "Date: " + dateStr + "\n"
+		header += "To: " + msg.ToList + "\n"
+		if msg.CcList != "" {
+			header += "Cc: " + msg.CcList + "\n"
+		}
+		header += "\n"
+
+		return "\n\n" + header + originalBody
+	}
+
+	// Reply format: citation + quoted lines
+	citation := fmt.Sprintf("On %s, %s wrote:", dateStr, sender)
+	quotedBody := quoteText(originalBody)
+	return "\n\n" + citation + "\n" + quotedBody
+}
+
+// buildReferences builds the References header from the original message
+func buildReferences(msg *message.Message) []string {
+	var refs []string
+
+	// Parse existing references
+	if msg.References != "" {
+		// References are space-separated
+		for _, ref := range splitByWhitespace(msg.References) {
+			ref = trimWhitespace(ref)
+			if ref != "" {
+				refs = append(refs, ref)
+			}
+		}
+	}
+
+	// Add the original message's Message-ID
+	if msg.MessageID != "" {
+		// Avoid duplicates
+		found := false
+		for _, ref := range refs {
+			if ref == msg.MessageID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			refs = append(refs, msg.MessageID)
+		}
+	}
+
+	return refs
+}
+
+// Helper string functions to avoid importing strings package conflicts
+func toLowerEmail(s string) string {
+	// Simple lowercase for ASCII emails
+	result := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		result[i] = c
+	}
+	return string(result)
+}
+
+func toLower(s string) string {
+	return toLowerEmail(s)
+}
+
+func trimWhitespace(s string) string {
+	start := 0
+	end := len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
+		end--
+	}
+	return s[start:end]
+}
+
+func trimQuotes(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+func findLastIndex(s string, ch byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == ch {
+			return i
+		}
+	}
+	return -1
+}
+
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+func splitByWhitespace(s string) []string {
+	var result []string
+	var current string
+	for _, ch := range s {
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+			if current != "" {
+				result = append(result, current)
+				current = ""
+			}
+		} else {
+			current += string(ch)
+		}
+	}
+	if current != "" {
+		result = append(result, current)
+	}
+	return result
+}
+
+func escapeHTML(s string) string {
+	var result string
+	for _, ch := range s {
+		switch ch {
+		case '<':
+			result += "&lt;"
+		case '>':
+			result += "&gt;"
+		case '&':
+			result += "&amp;"
+		case '"':
+			result += "&quot;"
+		default:
+			result += string(ch)
+		}
+	}
+	return result
+}
+
+func stripHTMLTags(s string) string {
+	var result string
+	inTag := false
+	for _, ch := range s {
+		if ch == '<' {
+			inTag = true
+		} else if ch == '>' {
+			inTag = false
+		} else if !inTag {
+			result += string(ch)
+		}
+	}
+	return result
+}
+
+func quoteText(s string) string {
+	var result string
+	lines := splitLines(s)
+	for _, line := range lines {
+		result += "> " + line + "\n"
+	}
+	return result
+}
+
+func splitLines(s string) []string {
+	var result []string
+	var current string
+	for _, ch := range s {
+		if ch == '\n' {
+			result = append(result, current)
+			current = ""
+		} else if ch != '\r' {
+			current += string(ch)
+		}
+	}
+	if current != "" {
+		result = append(result, current)
+	}
+	return result
+}
+
+// TestSMTPConnection tests the SMTP connection for an account config
+func (a *App) TestSMTPConnection(config account.AccountConfig) error {
+	log := logging.WithComponent("app")
+
+	// Create SMTP client
+	smtpConfig := smtp.DefaultConfig()
+	smtpConfig.Host = config.SMTPHost
+	smtpConfig.Port = config.SMTPPort
+	smtpConfig.Security = smtp.SecurityType(config.SMTPSecurity)
+	smtpConfig.Username = config.Username
+	smtpConfig.Password = config.Password
+
+	client := smtp.NewClient(smtpConfig)
+
+	if err := client.Connect(); err != nil {
+		log.Error().Err(err).Msg("SMTP connection test failed")
+		return fmt.Errorf("failed to connect: %w", err)
+	}
+	defer client.Close()
+
+	if err := client.Login(); err != nil {
+		log.Error().Err(err).Msg("SMTP login test failed")
+		return fmt.Errorf("failed to login: %w", err)
+	}
+
+	log.Info().Str("host", config.SMTPHost).Msg("SMTP connection test successful")
+	return nil
+}
+
+// ============================================================================
+// Draft API - Exposed to frontend via Wails bindings
+// Local-first draft saving with background IMAP sync
+// ============================================================================
+
+// DraftResult contains info about a saved draft
+type DraftResult struct {
+	ID         string `json:"id"`         // Local database ID
+	SyncStatus string `json:"syncStatus"` // "pending", "synced", "failed"
+	IMAPUID    uint32 `json:"imapUid"`    // IMAP UID (0 if not synced)
+}
+
+// SaveDraft saves a draft locally first, then attempts to sync to IMAP
+// If existingDraftID is provided, the old draft is updated
+func (a *App) SaveDraft(accountID string, msg smtp.ComposeMessage, existingDraftID string) (*DraftResult, error) {
+	log := logging.WithComponent("app")
+
+	log.Info().
+		Str("account_id", accountID).
+		Str("existing_draft_id", existingDraftID).
+		Str("subject", msg.Subject).
+		Msg("Saving draft (local-first)")
+
+	// Build references list JSON
+	referencesJSON := ""
+	if len(msg.References) > 0 {
+		if data, err := json.Marshal(msg.References); err == nil {
+			referencesJSON = string(data)
+		}
+	}
+
+	var localDraft *draft.Draft
+
+	if existingDraftID != "" {
+		// Update existing draft
+		localDraft, _ = a.draftStore.Get(existingDraftID)
+		if localDraft != nil {
+			localDraft.ToList = addressListToJSON(msg.To)
+			localDraft.CcList = addressListToJSON(msg.Cc)
+			localDraft.BccList = addressListToJSON(msg.Bcc)
+			localDraft.Subject = msg.Subject
+			localDraft.BodyHTML = msg.HTMLBody
+			localDraft.BodyText = msg.TextBody
+			localDraft.InReplyToID = msg.InReplyTo
+			localDraft.ReferencesList = referencesJSON
+			localDraft.SyncStatus = draft.SyncStatusPending // Mark for re-sync
+
+			if err := a.draftStore.Update(localDraft); err != nil {
+				return nil, fmt.Errorf("failed to update draft locally: %w", err)
+			}
+		}
+	}
+
+	if localDraft == nil {
+		// Create new draft
+		localDraft = &draft.Draft{
+			AccountID:      accountID,
+			ToList:         addressListToJSON(msg.To),
+			CcList:         addressListToJSON(msg.Cc),
+			BccList:        addressListToJSON(msg.Bcc),
+			Subject:        msg.Subject,
+			BodyHTML:       msg.HTMLBody,
+			BodyText:       msg.TextBody,
+			InReplyToID:    msg.InReplyTo,
+			ReferencesList: referencesJSON,
+			SyncStatus:     draft.SyncStatusPending,
+		}
+
+		if err := a.draftStore.Create(localDraft); err != nil {
+			return nil, fmt.Errorf("failed to save draft locally: %w", err)
+		}
+	}
+
+	log.Info().
+		Str("id", localDraft.ID).
+		Str("sync_status", string(localDraft.SyncStatus)).
+		Msg("Draft saved locally")
+
+	// Attempt to sync to IMAP in background (non-blocking)
+	go a.syncDraftToIMAP(localDraft, msg)
+
+	return &DraftResult{
+		ID:         localDraft.ID,
+		SyncStatus: string(localDraft.SyncStatus),
+		IMAPUID:    localDraft.IMAPUID,
+	}, nil
+}
+
+// syncDraftToIMAP syncs a single draft to IMAP server
+func (a *App) syncDraftToIMAP(localDraft *draft.Draft, msg smtp.ComposeMessage) {
+	log := logging.WithComponent("app")
+
+	// Helper to emit sync status change event
+	emitSyncStatus := func(status string, imapUID uint32, syncError string) {
+		wailsRuntime.EventsEmit(a.ctx, "draft:syncStatusChanged", map[string]interface{}{
+			"draftId":    localDraft.ID,
+			"syncStatus": status,
+			"imapUid":    imapUID,
+			"error":      syncError,
+		})
+	}
+
+	// Find the Drafts folder for this account (using GetSpecialFolder to respect folder mappings)
+	draftsFolder, err := a.GetSpecialFolder(localDraft.AccountID, folder.TypeDrafts)
+	if err != nil || draftsFolder == nil {
+		log.Warn().Err(err).Str("account_id", localDraft.AccountID).Msg("No drafts folder found, skipping IMAP sync")
+		a.draftStore.UpdateSyncStatus(localDraft.ID, draft.SyncStatusFailed, 0, "", "no drafts folder found")
+		emitSyncStatus("failed", 0, "no drafts folder found")
+		return
+	}
+
+	// Get IMAP connection from pool
+	poolConn, err := a.imapPool.GetConnection(a.ctx, localDraft.AccountID)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get IMAP connection, will retry later")
+		a.draftStore.UpdateSyncStatus(localDraft.ID, draft.SyncStatusFailed, 0, "", err.Error())
+		emitSyncStatus("failed", 0, err.Error())
+		return
+	}
+	defer a.imapPool.Release(poolConn)
+
+	conn := poolConn.Client()
+
+	// Delete old IMAP draft if it exists
+	if localDraft.IMAPUID > 0 && localDraft.FolderID != "" {
+		if _, err := conn.SelectMailbox(draftsFolder.Path); err == nil {
+			if err := conn.DeleteMessageByUID(goImap.UID(localDraft.IMAPUID)); err != nil {
+				log.Warn().Err(err).Uint32("uid", localDraft.IMAPUID).Msg("Failed to delete old draft from IMAP")
+			}
+		}
+	}
+
+	// Build RFC822 message
+	rawMsg, err := msg.ToRFC822()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to build RFC822 message")
+		a.draftStore.UpdateSyncStatus(localDraft.ID, draft.SyncStatusFailed, 0, "", err.Error())
+		emitSyncStatus("failed", 0, err.Error())
+		return
+	}
+
+	// Append to IMAP Drafts folder with \Draft and \Seen flags
+	flags := []goImap.Flag{goImap.FlagDraft, goImap.FlagSeen}
+	uid, err := conn.AppendMessage(draftsFolder.Path, flags, time.Now(), rawMsg)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to append draft to IMAP")
+		a.draftStore.UpdateSyncStatus(localDraft.ID, draft.SyncStatusFailed, 0, "", err.Error())
+		emitSyncStatus("failed", 0, err.Error())
+		return
+	}
+
+	// Update local draft with sync status
+	err = a.draftStore.UpdateSyncStatus(localDraft.ID, draft.SyncStatusSynced, uint32(uid), draftsFolder.ID, "")
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to update draft sync status")
+	}
+
+	// Emit success event
+	emitSyncStatus("synced", uint32(uid), "")
+
+	log.Info().
+		Str("id", localDraft.ID).
+		Uint32("imap_uid", uint32(uid)).
+		Msg("Draft synced to IMAP successfully")
+
+	// Sync the Drafts folder to refresh the message list view
+	if err := a.SyncFolder(localDraft.AccountID, draftsFolder.ID); err != nil {
+		log.Warn().Err(err).Str("folderID", draftsFolder.ID).Msg("Failed to sync Drafts folder after draft save")
+	}
+}
+
+// SyncPendingDrafts syncs all pending drafts for an account to IMAP
+// Called on app startup or when connection is restored
+func (a *App) SyncPendingDrafts(accountID string) error {
+	log := logging.WithComponent("app")
+
+	pendingDrafts, err := a.draftStore.ListPendingSync(accountID)
+	if err != nil {
+		return fmt.Errorf("failed to list pending drafts: %w", err)
+	}
+
+	if len(pendingDrafts) == 0 {
+		return nil
+	}
+
+	log.Info().
+		Str("account_id", accountID).
+		Int("count", len(pendingDrafts)).
+		Msg("Syncing pending drafts to IMAP")
+
+	for _, localDraft := range pendingDrafts {
+		// Rebuild the ComposeMessage from the draft
+		msg := a.draftToComposeMessage(localDraft)
+		a.syncDraftToIMAP(localDraft, msg)
+	}
+
+	return nil
+}
+
+// syncAllPendingDrafts syncs pending drafts for all accounts.
+// Called at startup to sync any drafts that failed to sync in previous sessions.
+func (a *App) syncAllPendingDrafts() {
+	log := logging.WithComponent("app")
+
+	accounts, err := a.accountStore.List()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to list accounts for draft sync")
+		return
+	}
+
+	for _, acc := range accounts {
+		if err := a.SyncPendingDrafts(acc.ID); err != nil {
+			log.Warn().Err(err).Str("account_id", acc.ID).Msg("Failed to sync pending drafts for account")
+		}
+	}
+}
+
+// draftToComposeMessage converts a local draft to a ComposeMessage
+func (a *App) draftToComposeMessage(d *draft.Draft) smtp.ComposeMessage {
+	toAddrs := parseAddressList(d.ToList)
+	ccAddrs := parseAddressList(d.CcList)
+	bccAddrs := parseAddressList(d.BccList)
+
+	var refs []string
+	if d.ReferencesList != "" {
+		json.Unmarshal([]byte(d.ReferencesList), &refs)
+	}
+
+	return smtp.ComposeMessage{
+		To:         toAddrs,
+		Cc:         ccAddrs,
+		Bcc:        bccAddrs,
+		Subject:    d.Subject,
+		HTMLBody:   d.BodyHTML,
+		TextBody:   d.BodyText,
+		InReplyTo:  d.InReplyToID,
+		References: refs,
+	}
+}
+
+// DeleteDraft deletes a draft from local DB and IMAP (if synced)
+func (a *App) DeleteDraft(accountID string, draftID string) error {
+	log := logging.WithComponent("app")
+
+	log.Info().
+		Str("account_id", accountID).
+		Str("draft_id", draftID).
+		Msg("Deleting draft")
+
+	// Get the local draft
+	localDraft, err := a.draftStore.Get(draftID)
+	if err != nil {
+		return fmt.Errorf("failed to get draft: %w", err)
+	}
+	if localDraft == nil {
+		// Already deleted, nothing to do
+		return nil
+	}
+
+	// If synced to IMAP, delete from server
+	if localDraft.IsSynced() {
+		draftsFolder, _ := a.GetSpecialFolder(accountID, folder.TypeDrafts)
+		if draftsFolder != nil {
+			poolConn, err := a.imapPool.GetConnection(a.ctx, accountID)
+			if err == nil {
+				defer a.imapPool.Release(poolConn)
+				imapClient := poolConn.Client()
+
+				if _, err := imapClient.SelectMailbox(draftsFolder.Path); err == nil {
+					if err := imapClient.DeleteMessageByUID(goImap.UID(localDraft.IMAPUID)); err != nil {
+						log.Warn().Err(err).Uint32("uid", localDraft.IMAPUID).Msg("Failed to delete draft from IMAP")
+					}
+				}
+			} else {
+				log.Warn().Err(err).Msg("Failed to get IMAP connection for draft deletion")
+			}
+		}
+	}
+
+	// Delete from local database
+	if err := a.draftStore.Delete(draftID); err != nil {
+		return fmt.Errorf("failed to delete draft from database: %w", err)
+	}
+
+	log.Info().Str("draft_id", draftID).Msg("Draft deleted successfully")
+
+	// Sync the Drafts folder to refresh the message list view
+	draftsFolder, _ := a.GetSpecialFolder(accountID, folder.TypeDrafts)
+	if draftsFolder != nil {
+		go func() {
+			if err := a.SyncFolder(accountID, draftsFolder.ID); err != nil {
+				log.Warn().Err(err).Str("folderID", draftsFolder.ID).Msg("Failed to sync Drafts folder after deletion")
+			}
+		}()
+	}
+
+	return nil
+}
+
+// GetDraft retrieves a draft from local DB and converts it to a ComposeMessage
+func (a *App) GetDraft(accountID string, draftID string) (*smtp.ComposeMessage, error) {
+	log := logging.WithComponent("app")
+
+	// Get the local draft
+	localDraft, err := a.draftStore.Get(draftID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get draft: %w", err)
+	}
+	if localDraft == nil {
+		return nil, fmt.Errorf("draft not found: %s", draftID)
+	}
+
+	// Convert to ComposeMessage
+	msg := a.draftToComposeMessage(localDraft)
+
+	log.Info().Str("draft_id", draftID).Msg("Draft retrieved for editing")
+	return &msg, nil
+}
+
+// ListDrafts returns all drafts for an account
+func (a *App) ListDrafts(accountID string) ([]*draft.Draft, error) {
+	return a.draftStore.ListByAccount(accountID)
+}
+
+// addressListToJSON converts a slice of addresses to JSON string for storage
+func addressListToJSON(addrs []smtp.Address) string {
+	if len(addrs) == 0 {
+		return ""
+	}
+
+	type jsonAddr struct {
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	}
+
+	jsonAddrs := make([]jsonAddr, len(addrs))
+	for i, addr := range addrs {
+		jsonAddrs[i] = jsonAddr{
+			Name:  addr.Name,
+			Email: addr.Address,
+		}
+	}
+
+	data, err := json.Marshal(jsonAddrs)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// ============================================================================
+// Contact API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// SearchContacts searches for contacts matching the query.
+// Results are merged from multiple sources:
+// - Local SQLite (aerion - sent recipients)
+// - vCard files (local .vcf files)
+// - CardDAV (synced from servers)
+// - Google People API (for Google OAuth accounts)
+//
+// Results are ranked by: send count > recency > source priority
+func (a *App) SearchContacts(query string, limit int) ([]*contact.Contact, error) {
+	log := logging.WithComponent("app")
+
+	if limit <= 0 {
+		limit = 10
+	}
+
+	// 1. Get contacts from local sources (Aerion DB, vCard, CardDAV)
+	localContacts, err := a.contactStore.Search(query, limit)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to search local contacts")
+		localContacts = []*contact.Contact{}
+	}
+
+	// 2. Search Google contacts for OAuth accounts
+	var googleContacts []*contact.Contact
+	accounts, err := a.accountStore.List()
+	if err == nil {
+		for _, acc := range accounts {
+			if acc.AuthType == account.AuthOAuth2 {
+				// Get the OAuth provider
+				provider, _ := a.credStore.GetOAuthProvider(acc.ID)
+				if provider != "google" {
+					continue
+				}
+
+				// Get a valid OAuth token (refreshing if needed)
+				tokens, err := a.getValidOAuthToken(acc.ID)
+				if err != nil {
+					log.Debug().
+						Err(err).
+						Str("accountID", acc.ID).
+						Msg("Failed to get OAuth token for Google contacts search")
+					continue
+				}
+
+				// Search Google contacts
+				results, err := a.googleContactsClient.Search(tokens.AccessToken, query, limit)
+				if err != nil {
+					log.Debug().
+						Err(err).
+						Str("accountID", acc.ID).
+						Msg("Google contacts search failed")
+					continue
+				}
+
+				googleContacts = append(googleContacts, results...)
+			}
+		}
+	}
+
+	// 3. Merge results (priority order: local > google)
+	// MergeResults handles deduplication by email
+	merged := contact.MergeResults(localContacts, googleContacts)
+
+	// 4. Apply limit
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+
+	return merged, nil
+}
+
+// GetContact returns a contact by email
+func (a *App) GetContact(email string) (*contact.Contact, error) {
+	return a.contactStore.Get(email)
+}
+
+// AddContact adds or updates a contact
+func (a *App) AddContact(email, displayName string) error {
+	return a.contactStore.AddOrUpdate(email, displayName)
+}
+
+// DeleteContact removes a contact
+func (a *App) DeleteContact(email string) error {
+	return a.contactStore.Delete(email)
+}
+
+// ListContacts returns all contacts
+func (a *App) ListContacts(limit int) ([]*contact.Contact, error) {
+	return a.contactStore.List(limit)
+}
+
+// ============================================================================
+// Composer Attachment API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// ComposerAttachment represents an attachment for the composer
+// Unlike smtp.Attachment, this uses base64 for JSON transport
+type ComposerAttachment struct {
+	Filename    string `json:"filename"`
+	ContentType string `json:"contentType"`
+	Size        int    `json:"size"`
+	Data        string `json:"data"` // base64 encoded content
+}
+
+// PickAttachmentFiles opens a file picker dialog and returns the selected files as attachments
+func (a *App) PickAttachmentFiles() ([]ComposerAttachment, error) {
+	log := logging.WithComponent("app")
+
+	// Show multi-file picker dialog
+	files, err := wailsRuntime.OpenMultipleFilesDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Select Attachments",
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to show file picker dialog")
+		return nil, fmt.Errorf("failed to show file picker: %w", err)
+	}
+
+	// User cancelled
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	var attachments []ComposerAttachment
+	for _, filePath := range files {
+		att, err := a.readFileAsAttachment(filePath)
+		if err != nil {
+			log.Warn().Err(err).Str("path", filePath).Msg("Failed to read file as attachment")
+			continue
+		}
+		attachments = append(attachments, *att)
+	}
+
+	log.Info().Int("count", len(attachments)).Msg("Files picked for attachment")
+	return attachments, nil
+}
+
+// ReadFileAsAttachment reads a file from disk and returns it as an attachment
+// This is used for drag-and-drop where we get file paths from the frontend
+func (a *App) ReadFileAsAttachment(filePath string) (*ComposerAttachment, error) {
+	return a.readFileAsAttachment(filePath)
+}
+
+// readFileAsAttachment reads a file and creates a ComposerAttachment
+func (a *App) readFileAsAttachment(filePath string) (*ComposerAttachment, error) {
+	log := logging.WithComponent("app")
+
+	// Read file content
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// Get filename
+	filename := filepath.Base(filePath)
+
+	// Detect content type from extension
+	contentType := detectContentType(filename)
+
+	// Encode to base64 for JSON transport
+	encoded := encodeBase64(content)
+
+	log.Debug().
+		Str("filename", filename).
+		Str("contentType", contentType).
+		Int("size", len(content)).
+		Msg("File read as attachment")
+
+	return &ComposerAttachment{
+		Filename:    filename,
+		ContentType: contentType,
+		Size:        len(content),
+		Data:        encoded,
+	}, nil
+}
+
+// detectContentType guesses content type from filename extension
+func detectContentType(filename string) string {
+	ext := toLower(filepath.Ext(filename))
+	switch ext {
+	// Images
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".ico":
+		return "image/x-icon"
+	case ".bmp":
+		return "image/bmp"
+	// Documents
+	case ".pdf":
+		return "application/pdf"
+	case ".doc":
+		return "application/msword"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".xls":
+		return "application/vnd.ms-excel"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".ppt":
+		return "application/vnd.ms-powerpoint"
+	case ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case ".odt":
+		return "application/vnd.oasis.opendocument.text"
+	case ".ods":
+		return "application/vnd.oasis.opendocument.spreadsheet"
+	case ".odp":
+		return "application/vnd.oasis.opendocument.presentation"
+	// Text
+	case ".txt":
+		return "text/plain"
+	case ".html", ".htm":
+		return "text/html"
+	case ".css":
+		return "text/css"
+	case ".js":
+		return "text/javascript"
+	case ".json":
+		return "application/json"
+	case ".xml":
+		return "application/xml"
+	case ".csv":
+		return "text/csv"
+	case ".md":
+		return "text/markdown"
+	// Archives
+	case ".zip":
+		return "application/zip"
+	case ".tar":
+		return "application/x-tar"
+	case ".gz", ".gzip":
+		return "application/gzip"
+	case ".7z":
+		return "application/x-7z-compressed"
+	case ".rar":
+		return "application/vnd.rar"
+	// Audio
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg":
+		return "audio/ogg"
+	case ".flac":
+		return "audio/flac"
+	// Video
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".avi":
+		return "video/x-msvideo"
+	case ".mov":
+		return "video/quicktime"
+	case ".mkv":
+		return "video/x-matroska"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// encodeBase64 encodes bytes to base64 string
+func encodeBase64(data []byte) string {
+	return fmt.Sprintf("%s",
+		func() string {
+			encoded := make([]byte, (len(data)+2)/3*4)
+			base64Encode(encoded, data)
+			return string(encoded[:base64EncodedLen(len(data))])
+		}())
+}
+
+// base64 encoding table
+const base64Table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+func base64Encode(dst, src []byte) {
+	for len(src) >= 3 {
+		dst[0] = base64Table[src[0]>>2]
+		dst[1] = base64Table[(src[0]&0x03)<<4|src[1]>>4]
+		dst[2] = base64Table[(src[1]&0x0f)<<2|src[2]>>6]
+		dst[3] = base64Table[src[2]&0x3f]
+		src = src[3:]
+		dst = dst[4:]
+	}
+	if len(src) > 0 {
+		dst[0] = base64Table[src[0]>>2]
+		if len(src) == 1 {
+			dst[1] = base64Table[(src[0]&0x03)<<4]
+			dst[2] = '='
+		} else {
+			dst[1] = base64Table[(src[0]&0x03)<<4|src[1]>>4]
+			dst[2] = base64Table[(src[1]&0x0f)<<2]
+		}
+		dst[3] = '='
+	}
+}
+
+func base64EncodedLen(n int) int {
+	return (n + 2) / 3 * 4
+}
+
+// ============================================================================
+// Read Receipt API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// GetReadReceiptResponsePolicy returns the current read receipt response policy
+// Values: "never", "ask", "always"
+func (a *App) GetReadReceiptResponsePolicy() (string, error) {
+	return a.settingsStore.GetReadReceiptResponsePolicy()
+}
+
+// SetReadReceiptResponsePolicy sets the read receipt response policy
+// Valid values: "never", "ask", "always"
+func (a *App) SetReadReceiptResponsePolicy(policy string) error {
+	return a.settingsStore.SetReadReceiptResponsePolicy(policy)
+}
+
+// GetMarkAsReadDelay returns the delay before marking messages as read (in milliseconds)
+// Returns: -1 = manual only, 0 = immediate, >0 = delay in ms
+func (a *App) GetMarkAsReadDelay() (int, error) {
+	return a.settingsStore.GetMarkAsReadDelay()
+}
+
+// SetMarkAsReadDelay sets the delay before marking messages as read (in milliseconds)
+// Valid values: -1 (manual only), 0 (immediate), or 100-5000 (delay in ms)
+func (a *App) SetMarkAsReadDelay(delayMs int) error {
+	return a.settingsStore.SetMarkAsReadDelay(delayMs)
+}
+
+// GetMessageListDensity returns the message list density setting
+func (a *App) GetMessageListDensity() (string, error) {
+	return a.settingsStore.GetMessageListDensity()
+}
+
+// SetMessageListDensity sets the message list density
+func (a *App) SetMessageListDensity(density string) error {
+	return a.settingsStore.SetMessageListDensity(density)
+}
+
+// GetMessageListSortOrder returns the message list sort order setting
+func (a *App) GetMessageListSortOrder() (string, error) {
+	return a.settingsStore.GetMessageListSortOrder()
+}
+
+// SetMessageListSortOrder sets the message list sort order
+func (a *App) SetMessageListSortOrder(sortOrder string) error {
+	return a.settingsStore.SetMessageListSortOrder(sortOrder)
+}
+
+// AddImageAllowlist adds a domain or sender to the image allowlist
+// entryType: "domain" or "sender"
+// value: the domain (e.g., "company.com") or email (e.g., "newsletter@company.com")
+func (a *App) AddImageAllowlist(entryType, value string) error {
+	return a.imageAllowlistStore.Add(entryType, value)
+}
+
+// RemoveImageAllowlist removes an entry from the image allowlist by ID
+func (a *App) RemoveImageAllowlist(id int64) error {
+	return a.imageAllowlistStore.Remove(id)
+}
+
+// IsImageAllowed checks if the sender's email or domain is in the allowlist
+func (a *App) IsImageAllowed(email string) (bool, error) {
+	return a.imageAllowlistStore.IsAllowed(email)
+}
+
+// GetImageAllowlist returns all allowlist entries
+func (a *App) GetImageAllowlist() ([]*settings.AllowlistEntry, error) {
+	return a.imageAllowlistStore.List()
+}
+
+// SendReadReceipt sends a read receipt (MDN) for the specified message
+func (a *App) SendReadReceipt(accountID, messageID string) error {
+	log := logging.WithComponent("app")
+
+	// Get the message
+	msg, err := a.messageStore.Get(messageID)
+	if err != nil {
+		return fmt.Errorf("failed to get message: %w", err)
+	}
+	if msg == nil {
+		return fmt.Errorf("message not found: %s", messageID)
+	}
+
+	// Check if read receipt is requested
+	if msg.ReadReceiptTo == "" {
+		return fmt.Errorf("message does not request a read receipt")
+	}
+
+	// Check if already handled
+	if msg.ReadReceiptHandled {
+		return fmt.Errorf("read receipt already handled for this message")
+	}
+
+	// Get account for SMTP settings
+	acc, err := a.accountStore.Get(accountID)
+	if err != nil {
+		return fmt.Errorf("failed to get account: %w", err)
+	}
+
+	// Get default identity for the account
+	identities, err := a.accountStore.GetIdentities(accountID)
+	if err != nil {
+		return fmt.Errorf("failed to get identities: %w", err)
+	}
+
+	var fromName, fromEmail string
+	for _, id := range identities {
+		if id.IsDefault {
+			fromName = id.Name
+			fromEmail = id.Email
+			break
+		}
+	}
+	if fromEmail == "" && len(identities) > 0 {
+		fromName = identities[0].Name
+		fromEmail = identities[0].Email
+	}
+	if fromEmail == "" {
+		fromEmail = acc.Email
+		fromName = acc.Name
+	}
+
+	// Build MDN message
+	mdnBytes, err := smtp.BuildMDN(msg, fromName, fromEmail, smtp.MDNDisplayed)
+	if err != nil {
+		return fmt.Errorf("failed to build MDN: %w", err)
+	}
+
+	// Create SMTP config
+	smtpConfig := smtp.ClientConfig{
+		Host:     acc.SMTPHost,
+		Port:     acc.SMTPPort,
+		Username: acc.Username,
+		Security: smtp.SecurityType(acc.SMTPSecurity),
+	}
+
+	// Handle authentication based on auth type
+	if acc.AuthType == account.AuthOAuth2 {
+		// Get valid OAuth token (refreshing if needed)
+		tokens, err := a.getValidOAuthToken(accountID)
+		if err != nil {
+			return fmt.Errorf("failed to get OAuth token: %w", err)
+		}
+		smtpConfig.AuthType = smtp.AuthTypeOAuth2
+		smtpConfig.AccessToken = tokens.AccessToken
+	} else {
+		// Default to password authentication
+		password, err := a.credStore.GetPassword(accountID)
+		if err != nil {
+			return fmt.Errorf("failed to get password: %w", err)
+		}
+		smtpConfig.AuthType = smtp.AuthTypePassword
+		smtpConfig.Password = password
+	}
+
+	// Create SMTP client and connect
+	client := smtp.NewClient(smtpConfig)
+	if err := client.Connect(); err != nil {
+		return fmt.Errorf("failed to connect to SMTP: %w", err)
+	}
+	defer client.Close()
+
+	// Extract recipient email
+	recipientEmail := extractEmailFromHeader(msg.ReadReceiptTo)
+
+	// Send the MDN
+	if err := client.SendMail(fromEmail, []string{recipientEmail}, mdnBytes); err != nil {
+		return fmt.Errorf("failed to send read receipt: %w", err)
+	}
+
+	// Mark as handled
+	if err := a.messageStore.MarkReadReceiptHandled(messageID); err != nil {
+		log.Warn().Err(err).Str("message_id", messageID).Msg("Failed to mark read receipt as handled")
+	}
+
+	log.Info().
+		Str("message_id", messageID).
+		Str("to", recipientEmail).
+		Msg("Read receipt sent")
+
+	return nil
+}
+
+// IgnoreReadReceipt marks a message's read receipt request as ignored (handled without sending)
+func (a *App) IgnoreReadReceipt(accountID, messageID string) error {
+	log := logging.WithComponent("app")
+
+	// Mark as handled without sending
+	if err := a.messageStore.MarkReadReceiptHandled(messageID); err != nil {
+		return fmt.Errorf("failed to mark read receipt as handled: %w", err)
+	}
+
+	log.Info().
+		Str("message_id", messageID).
+		Msg("Read receipt ignored")
+
+	return nil
+}
+
+// extractEmailFromHeader extracts the email address from a header value
+// e.g., "John Doe <john@example.com>" -> "john@example.com"
+func extractEmailFromHeader(header string) string {
+	header = strings.TrimSpace(header)
+
+	// Check if it's in "Name <email>" format
+	if start := strings.Index(header, "<"); start != -1 {
+		if end := strings.Index(header, ">"); end > start {
+			return header[start+1 : end]
+		}
+	}
+
+	// Otherwise, assume it's just an email address
+	return header
+}
+
+// ============================================================================
+// CardDAV Contact Source API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// DiscoverCardDAVAddressbooks discovers available addressbooks from a CardDAV server
+func (a *App) DiscoverCardDAVAddressbooks(url, username, password string) ([]carddav.AddressbookInfo, error) {
+	return carddav.DiscoverAddressbooks(url, username, password)
+}
+
+// TestCardDAVConnection tests connection to a CardDAV server
+func (a *App) TestCardDAVConnection(url, username, password string) error {
+	return carddav.TestConnection(url, username, password)
+}
+
+// GetContactSources returns all configured contact sources
+func (a *App) GetContactSources() ([]*carddav.Source, error) {
+	return a.carddavStore.ListSources()
+}
+
+// GetContactSource returns a single contact source by ID
+func (a *App) GetContactSource(id string) (*carddav.Source, error) {
+	return a.carddavStore.GetSource(id)
+}
+
+// AddContactSource creates a new contact source with addressbooks
+func (a *App) AddContactSource(config carddav.SourceConfig) (*carddav.Source, error) {
+	log := logging.WithComponent("app")
+
+	// Create the source
+	source, err := a.carddavStore.CreateSource(&config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create source: %w", err)
+	}
+
+	// Store password in credential store (use CardDAV-specific method)
+	if config.Password != "" {
+		if err := a.credStore.SetCardDAVPassword(source.ID, config.Password); err != nil {
+			// Rollback source creation
+			a.carddavStore.DeleteSource(source.ID)
+			return nil, fmt.Errorf("failed to store password: %w", err)
+		}
+	}
+
+	// Create addressbooks based on enabled paths
+	for _, path := range config.EnabledAddressbooks {
+		// Try to get the name from discovery
+		name := path
+		if parts := strings.Split(strings.Trim(path, "/"), "/"); len(parts) > 0 {
+			name = parts[len(parts)-1]
+		}
+
+		_, err := a.carddavStore.CreateAddressbook(source.ID, path, name, true)
+		if err != nil {
+			log.Warn().Err(err).Str("path", path).Msg("Failed to create addressbook")
+		}
+	}
+
+	// Trigger initial sync
+	go a.carddavSyncer.SyncSource(source.ID)
+
+	log.Info().Str("id", source.ID).Str("name", source.Name).Msg("Contact source created")
+	return source, nil
+}
+
+// UpdateContactSource updates an existing contact source
+func (a *App) UpdateContactSource(id string, config carddav.SourceConfig) error {
+	log := logging.WithComponent("app")
+
+	// Update the source
+	if err := a.carddavStore.UpdateSource(id, &config); err != nil {
+		return fmt.Errorf("failed to update source: %w", err)
+	}
+
+	// Update password if provided (use CardDAV-specific method)
+	if config.Password != "" {
+		if err := a.credStore.SetCardDAVPassword(id, config.Password); err != nil {
+			return fmt.Errorf("failed to update password: %w", err)
+		}
+	}
+
+	// Update addressbooks if provided
+	if len(config.EnabledAddressbooks) > 0 {
+		// Delete existing addressbooks
+		a.carddavStore.DeleteAddressbooksForSource(id)
+
+		// Create new ones
+		for _, path := range config.EnabledAddressbooks {
+			name := path
+			if parts := strings.Split(strings.Trim(path, "/"), "/"); len(parts) > 0 {
+				name = parts[len(parts)-1]
+			}
+			a.carddavStore.CreateAddressbook(id, path, name, true)
+		}
+	}
+
+	// Trigger resync
+	go a.carddavSyncer.SyncSource(id)
+
+	log.Info().Str("id", id).Msg("Contact source updated")
+	return nil
+}
+
+// DeleteContactSource deletes a contact source and all its data
+func (a *App) DeleteContactSource(id string) error {
+	log := logging.WithComponent("app")
+
+	// Delete from database (cascades to addressbooks and contacts)
+	if err := a.carddavStore.DeleteSource(id); err != nil {
+		return fmt.Errorf("failed to delete source: %w", err)
+	}
+
+	// Delete credentials
+	a.credStore.DeletePassword(id)
+
+	log.Info().Str("id", id).Msg("Contact source deleted")
+	return nil
+}
+
+// GetSourceAddressbooks returns all addressbooks for a source
+func (a *App) GetSourceAddressbooks(sourceID string) ([]*carddav.Addressbook, error) {
+	return a.carddavStore.ListAddressbooks(sourceID)
+}
+
+// SetAddressbookEnabled enables or disables an addressbook
+func (a *App) SetAddressbookEnabled(addressbookID string, enabled bool) error {
+	return a.carddavStore.SetAddressbookEnabled(addressbookID, enabled)
+}
+
+// SyncContactSource manually triggers a sync for a source
+func (a *App) SyncContactSource(id string) error {
+	return a.carddavSyncer.SyncSource(id)
+}
+
+// SyncAllContactSources manually triggers a sync for all sources
+func (a *App) SyncAllContactSources() error {
+	return a.carddavSyncer.SyncAllSources()
+}
+
+// GetContactSourceErrors returns all sources that have errors
+func (a *App) GetContactSourceErrors() ([]*carddav.SourceError, error) {
+	return a.carddavStore.GetSourcesWithErrors()
+}
+
+// ClearContactSourceError clears the error for a source
+func (a *App) ClearContactSourceError(id string) error {
+	return a.carddavStore.ClearSourceError(id)
+}
+
+// GetContactSourceStats returns statistics for contact sources
+func (a *App) GetContactSourceStats() (map[string]interface{}, error) {
+	sources, err := a.carddavStore.ListSources()
+	if err != nil {
+		return nil, err
+	}
+
+	totalContacts, _ := a.carddavStore.CountContacts()
+	sourcesWithErrors, _ := a.carddavStore.GetSourcesWithErrors()
+
+	return map[string]interface{}{
+		"total_sources":       len(sources),
+		"total_contacts":      totalContacts,
+		"sources_with_errors": len(sourcesWithErrors),
+	}, nil
+}
+
+// ============================================================================
+// OAuth2 API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// OAuthStatus represents the OAuth status for an account
+type OAuthStatus struct {
+	IsOAuth     bool      `json:"isOAuth"`     // Whether the account uses OAuth
+	Provider    string    `json:"provider"`    // OAuth provider name (google, microsoft)
+	Email       string    `json:"email"`       // Authenticated email address
+	ExpiresAt   time.Time `json:"expiresAt"`   // Token expiry time
+	IsExpired   bool      `json:"isExpired"`   // Whether the token has expired
+	NeedsReauth bool      `json:"needsReauth"` // Whether re-authorization is required
+}
+
+// StartOAuthFlow initiates the OAuth2 authorization flow for a provider.
+// Opens the system browser with the authorization URL and waits for callback.
+// Emits events: oauth:started, oauth:success, oauth:error
+func (a *App) StartOAuthFlow(provider string) error {
+	log := logging.WithComponent("app.oauth")
+
+	// Check if provider is configured
+	if !oauth2.IsProviderConfigured(provider) {
+		return fmt.Errorf("OAuth provider %s is not configured", provider)
+	}
+
+	log.Info().Str("provider", provider).Msg("Starting OAuth flow")
+
+	// Emit started event
+	wailsRuntime.EventsEmit(a.ctx, "oauth:started", map[string]interface{}{
+		"provider": provider,
+	})
+
+	// Start the OAuth flow
+	authURL, err := a.oauth2Manager.StartAuthFlow(a.ctx, provider)
+	if err != nil {
+		wailsRuntime.EventsEmit(a.ctx, "oauth:error", map[string]interface{}{
+			"provider": provider,
+			"error":    err.Error(),
+		})
+		return fmt.Errorf("failed to start OAuth flow: %w", err)
+	}
+
+	// Open browser with auth URL
+	wailsRuntime.BrowserOpenURL(a.ctx, authURL)
+
+	// Wait for callback in background
+	go func() {
+		tokens, email, err := a.oauth2Manager.WaitForCallback(a.ctx)
+		if err != nil {
+			log.Error().Err(err).Str("provider", provider).Msg("OAuth callback failed")
+			wailsRuntime.EventsEmit(a.ctx, "oauth:error", map[string]interface{}{
+				"provider": provider,
+				"error":    err.Error(),
+			})
+			return
+		}
+
+		// Store tokens temporarily for account creation
+		a.pendingOAuthTokens = tokens
+		a.pendingOAuthEmail = email
+
+		log.Info().
+			Str("provider", provider).
+			Str("email", email).
+			Msg("OAuth flow completed successfully")
+
+		// Emit success event with tokens info (frontend will handle account creation)
+		wailsRuntime.EventsEmit(a.ctx, "oauth:success", map[string]interface{}{
+			"provider":  provider,
+			"email":     email,
+			"expiresIn": tokens.ExpiresIn,
+		})
+	}()
+
+	return nil
+}
+
+// CompleteOAuthAccountSetup completes account setup after successful OAuth flow.
+// This should be called by the frontend after receiving oauth:success event.
+// It creates the account and saves the OAuth tokens from the completed flow.
+func (a *App) CompleteOAuthAccountSetup(provider, email, accountName, displayName, color string) (*account.Account, error) {
+	log := logging.WithComponent("app.oauth")
+
+	log.Info().
+		Str("provider", provider).
+		Str("email", email).
+		Str("name", accountName).
+		Msg("Completing OAuth account setup")
+
+	// Check that we have pending tokens from the OAuth flow
+	if a.pendingOAuthTokens == nil {
+		return nil, fmt.Errorf("no pending OAuth tokens - please complete the sign-in process first")
+	}
+
+	// Verify the email matches
+	if a.pendingOAuthEmail != "" && a.pendingOAuthEmail != email {
+		log.Warn().
+			Str("expected", a.pendingOAuthEmail).
+			Str("provided", email).
+			Msg("OAuth email mismatch, using provided email")
+	}
+
+	// Get provider config for IMAP/SMTP settings
+	providerConfig, err := oauth2.GetProvider(provider)
+	if err != nil {
+		return nil, fmt.Errorf("unknown provider: %w", err)
+	}
+
+	// Build account config based on provider
+	var config account.AccountConfig
+	switch provider {
+	case "google":
+		config = account.AccountConfig{
+			Name:         accountName,
+			DisplayName:  displayName,
+			Color:        color,
+			Email:        email,
+			Username:     email,
+			AuthType:     account.AuthOAuth2,
+			IMAPHost:     "imap.gmail.com",
+			IMAPPort:     993,
+			IMAPSecurity: account.SecurityTLS,
+			SMTPHost:     "smtp.gmail.com",
+			SMTPPort:     587,
+			SMTPSecurity: account.SecurityStartTLS,
+		}
+	case "microsoft":
+		config = account.AccountConfig{
+			Name:         accountName,
+			DisplayName:  displayName,
+			Color:        color,
+			Email:        email,
+			Username:     email,
+			AuthType:     account.AuthOAuth2,
+			IMAPHost:     "outlook.office365.com",
+			IMAPPort:     993,
+			IMAPSecurity: account.SecurityTLS,
+			SMTPHost:     "smtp.office365.com",
+			SMTPPort:     587,
+			SMTPSecurity: account.SecurityStartTLS,
+		}
+	default:
+		return nil, fmt.Errorf("unsupported OAuth provider: %s", provider)
+	}
+
+	// Create the account
+	acc, err := a.accountStore.Create(&config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create account: %w", err)
+	}
+
+	// Calculate token expiry
+	expiresAt := time.Now().Add(time.Duration(a.pendingOAuthTokens.ExpiresIn) * time.Second)
+
+	// Save OAuth tokens
+	tokens := &credentials.OAuthTokens{
+		Provider:     provider,
+		AccessToken:  a.pendingOAuthTokens.AccessToken,
+		RefreshToken: a.pendingOAuthTokens.RefreshToken,
+		ExpiresAt:    expiresAt,
+		Scopes:       providerConfig.Scopes,
+	}
+
+	log.Debug().
+		Str("accountID", acc.ID).
+		Str("provider", provider).
+		Int("accessTokenLen", len(tokens.AccessToken)).
+		Int("refreshTokenLen", len(tokens.RefreshToken)).
+		Time("expiresAt", expiresAt).
+		Strs("scopes", tokens.Scopes).
+		Msg("Saving OAuth tokens")
+
+	if err := a.credStore.SetOAuthTokens(acc.ID, tokens); err != nil {
+		// Rollback: delete the account if we can't save tokens
+		log.Error().Err(err).Str("accountID", acc.ID).Msg("Failed to save OAuth tokens, rolling back account creation")
+		a.accountStore.Delete(acc.ID)
+		return nil, fmt.Errorf("failed to save OAuth tokens: %w", err)
+	}
+
+	log.Debug().Str("accountID", acc.ID).Msg("OAuth tokens saved successfully")
+
+	// Clear pending tokens
+	a.pendingOAuthTokens = nil
+	a.pendingOAuthEmail = ""
+
+	log.Info().
+		Str("accountID", acc.ID).
+		Str("email", email).
+		Str("provider", provider).
+		Time("tokenExpiry", expiresAt).
+		Msg("OAuth account created and tokens saved successfully")
+
+	// Scale database connection pool for new account
+	a.updateDBConnectionPool()
+
+	return acc, nil
+}
+
+// SaveOAuthTokens stores OAuth tokens for an account after OAuth flow completion.
+// This should be called immediately after CompleteOAuthAccountSetup.
+func (a *App) SaveOAuthTokens(accountID, provider string, accessToken, refreshToken string, expiresIn int) error {
+	log := logging.WithComponent("app.oauth")
+
+	// Calculate expiry time
+	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
+
+	// Get scopes from provider config
+	providerConfig, err := oauth2.GetProvider(provider)
+	if err != nil {
+		return fmt.Errorf("unknown provider: %w", err)
+	}
+
+	tokens := &credentials.OAuthTokens{
+		Provider:     provider,
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresAt:    expiresAt,
+		Scopes:       providerConfig.Scopes,
+	}
+
+	if err := a.credStore.SetOAuthTokens(accountID, tokens); err != nil {
+		return fmt.Errorf("failed to store OAuth tokens: %w", err)
+	}
+
+	log.Info().
+		Str("accountID", accountID).
+		Str("provider", provider).
+		Time("expiresAt", expiresAt).
+		Msg("OAuth tokens saved")
+
+	return nil
+}
+
+// CancelOAuthFlow cancels any in-progress OAuth authorization flow.
+func (a *App) CancelOAuthFlow() {
+	log := logging.WithComponent("app.oauth")
+	log.Info().Msg("Cancelling OAuth flow")
+
+	a.oauth2Manager.CancelAuthFlow()
+
+	// Clear any pending tokens
+	a.pendingOAuthTokens = nil
+	a.pendingOAuthEmail = ""
+
+	wailsRuntime.EventsEmit(a.ctx, "oauth:cancelled", nil)
+}
+
+// GetOAuthStatus returns the OAuth status for an account.
+func (a *App) GetOAuthStatus(accountID string) (*OAuthStatus, error) {
+	acc, err := a.accountStore.Get(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get account: %w", err)
+	}
+	if acc == nil {
+		return nil, fmt.Errorf("account not found: %s", accountID)
+	}
+
+	status := &OAuthStatus{
+		IsOAuth: acc.AuthType == account.AuthOAuth2,
+	}
+
+	if !status.IsOAuth {
+		return status, nil
+	}
+
+	// Get OAuth token info
+	tokens, err := a.credStore.GetOAuthTokens(accountID)
+	if err != nil {
+		// Tokens not found - needs re-auth
+		status.NeedsReauth = true
+		return status, nil
+	}
+
+	status.Provider = tokens.Provider
+	status.ExpiresAt = tokens.ExpiresAt
+	status.IsExpired = tokens.IsExpired()
+	status.NeedsReauth = tokens.IsExpired() && tokens.RefreshToken == ""
+
+	return status, nil
+}
+
+// IsOAuthConfigured returns whether OAuth is configured for a provider.
+// This checks if the client ID was provided at build time.
+func (a *App) IsOAuthConfigured(provider string) bool {
+	return oauth2.IsProviderConfigured(provider)
+}
+
+// GetConfiguredOAuthProviders returns a list of OAuth providers that are configured.
+func (a *App) GetConfiguredOAuthProviders() []string {
+	var configured []string
+	for _, p := range oauth2.SupportedProviders() {
+		if oauth2.IsProviderConfigured(p) {
+			configured = append(configured, p)
+		}
+	}
+	return configured
+}
+
+// ReauthorizeAccount initiates re-authorization for an existing OAuth account.
+// This is used when tokens have expired and refresh has failed.
+func (a *App) ReauthorizeAccount(accountID string) error {
+	log := logging.WithComponent("app.oauth")
+
+	acc, err := a.accountStore.Get(accountID)
+	if err != nil {
+		return fmt.Errorf("failed to get account: %w", err)
+	}
+	if acc == nil {
+		return fmt.Errorf("account not found: %s", accountID)
+	}
+
+	if acc.AuthType != account.AuthOAuth2 {
+		return fmt.Errorf("account is not an OAuth account")
+	}
+
+	// Get the provider from stored tokens
+	provider, err := a.credStore.GetOAuthProvider(accountID)
+	if err != nil || provider == "" {
+		return fmt.Errorf("could not determine OAuth provider for account")
+	}
+
+	log.Info().
+		Str("accountID", accountID).
+		Str("provider", provider).
+		Msg("Starting re-authorization for account")
+
+	// Start OAuth flow - frontend will handle storing new tokens
+	return a.StartOAuthFlow(provider)
+}
+
+// TestOAuthConnection tests the connection for an OAuth account.
+// This verifies that the stored tokens work for IMAP access.
+func (a *App) TestOAuthConnection(accountID string) error {
+	log := logging.WithComponent("app.oauth")
+
+	acc, err := a.accountStore.Get(accountID)
+	if err != nil {
+		return fmt.Errorf("failed to get account: %w", err)
+	}
+	if acc == nil {
+		return fmt.Errorf("account not found: %s", accountID)
+	}
+
+	if acc.AuthType != account.AuthOAuth2 {
+		return fmt.Errorf("account is not an OAuth account")
+	}
+
+	// Get valid OAuth token
+	tokens, err := a.getValidOAuthToken(accountID)
+	if err != nil {
+		return fmt.Errorf("failed to get OAuth token: %w", err)
+	}
+
+	// Create IMAP client and test connection
+	clientConfig := imap.DefaultConfig()
+	clientConfig.Host = acc.IMAPHost
+	clientConfig.Port = acc.IMAPPort
+	clientConfig.Security = imap.SecurityType(acc.IMAPSecurity)
+	clientConfig.Username = acc.Username
+	clientConfig.AuthType = imap.AuthTypeOAuth2
+	clientConfig.AccessToken = tokens.AccessToken
+
+	client := imap.NewClient(clientConfig)
+
+	if err := client.Connect(); err != nil {
+		log.Error().Err(err).Msg("OAuth connection test failed")
+		return fmt.Errorf("failed to connect: %w", err)
+	}
+	defer client.Close()
+
+	if err := client.Login(); err != nil {
+		log.Error().Err(err).Msg("OAuth login test failed")
+		return fmt.Errorf("failed to authenticate: %w", err)
+	}
+
+	log.Info().Str("accountID", accountID).Msg("OAuth connection test successful")
+	return nil
+}
+
+// ============================================================================
+// Message Actions API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// MarkAsRead marks messages as read
+func (a *App) MarkAsRead(messageIDs []string) error {
+	return a.setReadStatus(messageIDs, true)
+}
+
+// MarkAsUnread marks messages as unread
+func (a *App) MarkAsUnread(messageIDs []string) error {
+	return a.setReadStatus(messageIDs, false)
+}
+
+func (a *App) setReadStatus(messageIDs []string, isRead bool) error {
+	log := logging.WithComponent("app")
+
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	// Get messages to find their UIDs and folders
+	messages, err := a.messageStore.GetByIDs(messageIDs)
+	if err != nil {
+		return fmt.Errorf("failed to get messages: %w", err)
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+
+	// Group by folder for IMAP operations
+	byFolder := make(map[string][]*message.Message)
+	for _, m := range messages {
+		byFolder[m.FolderID] = append(byFolder[m.FolderID], m)
+	}
+
+	// Update local DB first (local-first)
+	isReadPtr := &isRead
+	if err := a.messageStore.UpdateFlagsBatch(messageIDs, isReadPtr, nil); err != nil {
+		return fmt.Errorf("failed to update local flags: %w", err)
+	}
+
+	// Emit event for UI update with flag state
+	wailsRuntime.EventsEmit(a.ctx, "messages:flagsChanged", map[string]interface{}{
+		"messageIds": messageIDs,
+		"isRead":     isRead,
+	})
+
+	// Update folder unread counts in background to avoid blocking other DB operations
+	go func() {
+		folderCounts := make(map[string]int)
+		for folderID := range byFolder {
+			unreadCount, err := a.messageStore.CountUnreadByFolder(folderID)
+			if err != nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to count unread messages")
+				continue
+			}
+			folderObj, err := a.folderStore.Get(folderID)
+			if err != nil || folderObj == nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to get folder")
+				continue
+			}
+			if err := a.folderStore.UpdateCounts(folderID, folderObj.TotalCount, unreadCount); err != nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to update folder counts")
+				continue
+			}
+			folderCounts[folderID] = unreadCount
+		}
+		if len(folderCounts) > 0 {
+			wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", folderCounts)
+		}
+	}()
+
+	// Sync to IMAP in background with retry
+	go func() {
+		for folderID, msgs := range byFolder {
+			var err error
+			for attempt := 1; attempt <= 3; attempt++ {
+				err = a.syncFlagsToIMAP(msgs, folderID, "read", isRead)
+				if err == nil {
+					break
+				}
+				log.Warn().Err(err).Int("attempt", attempt).Str("folderID", folderID).Msg("Failed to sync read flags to IMAP, retrying...")
+				time.Sleep(time.Duration(attempt) * time.Second)
+			}
+			if err != nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to sync read flags to IMAP after 3 attempts")
+			}
+		}
+	}()
+
+	// Create undo command
+	firstMsg := messages[0]
+	folderObj, _ := a.folderStore.Get(firstMsg.FolderID)
+	if folderObj != nil {
+		uids := make([]uint32, len(messages))
+		for i, m := range messages {
+			uids[i] = m.UID
+		}
+
+		description := "Mark as read"
+		if !isRead {
+			description = "Mark as unread"
+		}
+
+		cmd := undo.NewFlagChangeCommand(
+			a.ctx,
+			a,
+			firstMsg.AccountID,
+			folderObj.Path,
+			messageIDs,
+			uids,
+			"read",
+			!isRead, // previous state was opposite
+			description,
+		)
+		a.undoStack.Push(cmd)
+	}
+
+	return nil
+}
+
+// Star marks messages as starred
+func (a *App) Star(messageIDs []string) error {
+	return a.setStarredStatus(messageIDs, true)
+}
+
+// Unstar removes star from messages
+func (a *App) Unstar(messageIDs []string) error {
+	return a.setStarredStatus(messageIDs, false)
+}
+
+func (a *App) setStarredStatus(messageIDs []string, isStarred bool) error {
+	log := logging.WithComponent("app")
+
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	messages, err := a.messageStore.GetByIDs(messageIDs)
+	if err != nil {
+		return fmt.Errorf("failed to get messages: %w", err)
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+
+	byFolder := make(map[string][]*message.Message)
+	for _, m := range messages {
+		byFolder[m.FolderID] = append(byFolder[m.FolderID], m)
+	}
+
+	// Update local DB first
+	isStarredPtr := &isStarred
+	if err := a.messageStore.UpdateFlagsBatch(messageIDs, nil, isStarredPtr); err != nil {
+		return fmt.Errorf("failed to update local flags: %w", err)
+	}
+
+	wailsRuntime.EventsEmit(a.ctx, "messages:flagsChanged", messageIDs)
+
+	// Sync to IMAP in background with retry
+	go func() {
+		for folderID, msgs := range byFolder {
+			var err error
+			for attempt := 1; attempt <= 3; attempt++ {
+				err = a.syncFlagsToIMAP(msgs, folderID, "starred", isStarred)
+				if err == nil {
+					break
+				}
+				log.Warn().Err(err).Int("attempt", attempt).Str("folderID", folderID).Msg("Failed to sync starred flags to IMAP, retrying...")
+				time.Sleep(time.Duration(attempt) * time.Second)
+			}
+			if err != nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to sync starred flags to IMAP after 3 attempts")
+			}
+		}
+	}()
+
+	// Create undo command
+	firstMsg := messages[0]
+	folderObj, _ := a.folderStore.Get(firstMsg.FolderID)
+	if folderObj != nil {
+		uids := make([]uint32, len(messages))
+		for i, m := range messages {
+			uids[i] = m.UID
+		}
+
+		description := "Star"
+		if !isStarred {
+			description = "Unstar"
+		}
+
+		cmd := undo.NewFlagChangeCommand(
+			a.ctx,
+			a,
+			firstMsg.AccountID,
+			folderObj.Path,
+			messageIDs,
+			uids,
+			"starred",
+			!isStarred,
+			description,
+		)
+		a.undoStack.Push(cmd)
+	}
+
+	return nil
+}
+
+// syncFlagsToIMAP syncs flag changes to IMAP server
+func (a *App) syncFlagsToIMAP(messages []*message.Message, folderID, flagType string, flagValue bool) error {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	folderObj, err := a.folderStore.Get(folderID)
+	if err != nil || folderObj == nil {
+		return fmt.Errorf("folder not found: %s", folderID)
+	}
+
+	poolConn, err := a.imapPool.GetConnection(a.ctx, messages[0].AccountID)
+	if err != nil {
+		return fmt.Errorf("failed to get IMAP connection: %w", err)
+	}
+	defer a.imapPool.Release(poolConn)
+
+	conn := poolConn.Client()
+	if _, err := conn.SelectMailbox(folderObj.Path); err != nil {
+		return fmt.Errorf("failed to select mailbox: %w", err)
+	}
+
+	uids := make([]goImap.UID, len(messages))
+	for i, m := range messages {
+		uids[i] = goImap.UID(m.UID)
+	}
+
+	var flag goImap.Flag
+	switch flagType {
+	case "read":
+		flag = goImap.FlagSeen
+	case "starred":
+		flag = goImap.FlagFlagged
+	}
+
+	if flagValue {
+		return conn.AddMessageFlags(uids, []goImap.Flag{flag})
+	}
+	return conn.RemoveMessageFlags(uids, []goImap.Flag{flag})
+}
+
+// MoveToFolder moves messages to a specified folder
+func (a *App) MoveToFolder(messageIDs []string, destFolderID string) error {
+	log := logging.WithComponent("app")
+
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	messages, err := a.messageStore.GetByIDs(messageIDs)
+	if err != nil {
+		return fmt.Errorf("failed to get messages: %w", err)
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+
+	destFolder, err := a.folderStore.Get(destFolderID)
+	if err != nil || destFolder == nil {
+		return fmt.Errorf("destination folder not found: %s", destFolderID)
+	}
+
+	// Group by source folder
+	byFolder := make(map[string][]*message.Message)
+	for _, m := range messages {
+		byFolder[m.FolderID] = append(byFolder[m.FolderID], m)
+	}
+
+	// Update local DB first
+	if err := a.messageStore.MoveMessages(messageIDs, destFolderID); err != nil {
+		return fmt.Errorf("failed to move messages locally: %w", err)
+	}
+
+	wailsRuntime.EventsEmit(a.ctx, "messages:moved", map[string]interface{}{
+		"messageIds":   messageIDs,
+		"destFolderId": destFolderID,
+	})
+
+	// Update folder unread counts for source and destination folders
+	go func() {
+		folderCounts := make(map[string]int)
+
+		// Update source folders
+		for folderID, msgs := range byFolder {
+			unreadCount, err := a.messageStore.CountUnreadByFolder(folderID)
+			if err != nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to count unread messages")
+				continue
+			}
+			folderObj, err := a.folderStore.Get(folderID)
+			if err != nil || folderObj == nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to get folder")
+				continue
+			}
+			newTotalCount := folderObj.TotalCount - len(msgs)
+			if newTotalCount < 0 {
+				newTotalCount = 0
+			}
+			if err := a.folderStore.UpdateCounts(folderID, newTotalCount, unreadCount); err != nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to update folder counts")
+				continue
+			}
+			folderCounts[folderID] = unreadCount
+		}
+
+		// Update destination folder
+		unreadCount, err := a.messageStore.CountUnreadByFolder(destFolderID)
+		if err != nil {
+			log.Error().Err(err).Str("folderID", destFolderID).Msg("Failed to count unread messages for destination")
+		} else {
+			destFolderObj, err := a.folderStore.Get(destFolderID)
+			if err == nil && destFolderObj != nil {
+				newTotalCount := destFolderObj.TotalCount + len(messageIDs)
+				if err := a.folderStore.UpdateCounts(destFolderID, newTotalCount, unreadCount); err != nil {
+					log.Error().Err(err).Str("folderID", destFolderID).Msg("Failed to update destination folder counts")
+				} else {
+					folderCounts[destFolderID] = unreadCount
+				}
+			}
+		}
+
+		if len(folderCounts) > 0 {
+			wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", folderCounts)
+		}
+	}()
+
+	// Sync to IMAP in background (COPY + DELETE)
+	go func() {
+		for sourceFolderID, msgs := range byFolder {
+			if err := a.moveMessagesToIMAP(msgs, sourceFolderID, destFolder); err != nil {
+				log.Error().Err(err).
+					Str("sourceFolderID", sourceFolderID).
+					Str("destFolderID", destFolderID).
+					Msg("Failed to move messages on IMAP")
+			}
+		}
+	}()
+
+	// Create undo command for each source folder
+	for sourceFolderID, msgs := range byFolder {
+		sourceFolder, _ := a.folderStore.Get(sourceFolderID)
+		if sourceFolder == nil {
+			continue
+		}
+
+		msgIDs := make([]string, len(msgs))
+		uids := make([]uint32, len(msgs))
+		for i, m := range msgs {
+			msgIDs[i] = m.ID
+			uids[i] = m.UID
+		}
+
+		cmd := undo.NewMoveCommand(
+			a.ctx,
+			a,
+			msgs[0].AccountID,
+			msgIDs,
+			uids,
+			sourceFolderID,
+			sourceFolder.Path,
+			destFolderID,
+			destFolder.Path,
+			fmt.Sprintf("Move to %s", destFolder.Name),
+		)
+		a.undoStack.Push(cmd)
+	}
+
+	return nil
+}
+
+func (a *App) moveMessagesToIMAP(messages []*message.Message, sourceFolderID string, destFolder *folder.Folder) error {
+	log := logging.WithComponent("app.moveMessagesToIMAP")
+
+	if len(messages) == 0 {
+		return nil
+	}
+
+	sourceFolder, err := a.folderStore.Get(sourceFolderID)
+	if err != nil || sourceFolder == nil {
+		return fmt.Errorf("source folder not found")
+	}
+
+	// Collect UIDs for logging
+	uidList := make([]uint32, len(messages))
+	for i, m := range messages {
+		uidList[i] = m.UID
+	}
+
+	log.Info().
+		Str("sourceFolder", sourceFolder.Path).
+		Str("destFolder", destFolder.Path).
+		Uints32("uids", uidList).
+		Int("count", len(messages)).
+		Msg("Starting IMAP move operation")
+
+	poolConn, err := a.imapPool.GetConnection(a.ctx, messages[0].AccountID)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to get IMAP connection")
+		return fmt.Errorf("failed to get IMAP connection: %w", err)
+	}
+	defer a.imapPool.Release(poolConn)
+
+	conn := poolConn.Client()
+
+	// Select source mailbox
+	log.Debug().Str("mailbox", sourceFolder.Path).Msg("Selecting source mailbox")
+	if _, err := conn.SelectMailbox(sourceFolder.Path); err != nil {
+		log.Error().Err(err).Str("mailbox", sourceFolder.Path).Msg("Failed to select source mailbox")
+		return fmt.Errorf("failed to select source mailbox: %w", err)
+	}
+
+	uids := make([]goImap.UID, len(messages))
+	for i, m := range messages {
+		uids[i] = goImap.UID(m.UID)
+	}
+
+	// COPY to destination
+	log.Debug().Str("destMailbox", destFolder.Path).Msg("Copying messages to destination")
+	if _, err := conn.CopyMessages(uids, destFolder.Path); err != nil {
+		log.Error().Err(err).Str("destMailbox", destFolder.Path).Msg("Failed to copy messages")
+		return fmt.Errorf("failed to copy messages: %w", err)
+	}
+	log.Debug().Msg("Messages copied successfully")
+
+	// DELETE from source
+	log.Debug().Msg("Deleting messages from source (marking deleted + expunge)")
+	if err := conn.DeleteMessagesByUID(uids); err != nil {
+		log.Error().Err(err).Msg("Failed to delete messages from source")
+		return fmt.Errorf("failed to delete messages from source: %w", err)
+	}
+
+	log.Info().
+		Str("sourceFolder", sourceFolder.Path).
+		Str("destFolder", destFolder.Path).
+		Int("count", len(messages)).
+		Msg("IMAP move operation completed successfully")
+
+	return nil
+}
+
+// CopyToFolder copies messages to a specified folder (keeps original)
+// Unlike MoveToFolder, this only copies - original messages remain in place
+func (a *App) CopyToFolder(messageIDs []string, destFolderID string) error {
+	log := logging.WithComponent("app")
+
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	messages, err := a.messageStore.GetByIDs(messageIDs)
+	if err != nil {
+		return fmt.Errorf("failed to get messages: %w", err)
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+
+	destFolder, err := a.folderStore.Get(destFolderID)
+	if err != nil || destFolder == nil {
+		return fmt.Errorf("destination folder not found: %s", destFolderID)
+	}
+
+	// Group by source folder
+	byFolder := make(map[string][]*message.Message)
+	for _, m := range messages {
+		byFolder[m.FolderID] = append(byFolder[m.FolderID], m)
+	}
+
+	// Copy on IMAP (no local DB change - messages stay in source folder)
+	go func() {
+		for sourceFolderID, msgs := range byFolder {
+			if err := a.copyMessagesToIMAP(msgs, sourceFolderID, destFolder); err != nil {
+				log.Error().Err(err).
+					Str("sourceFolderID", sourceFolderID).
+					Str("destFolderID", destFolderID).
+					Msg("Failed to copy messages on IMAP")
+			}
+		}
+
+		// After copy completes, sync destination folder to fetch new copies
+		if len(messages) > 0 {
+			// Get account sync period (0 means all messages)
+			syncPeriodDays := 30
+			if acc, err := a.accountStore.Get(messages[0].AccountID); err == nil && acc != nil {
+				syncPeriodDays = acc.SyncPeriodDays
+			}
+			if err := a.syncEngine.SyncMessages(a.ctx, messages[0].AccountID, destFolderID, syncPeriodDays); err != nil {
+				log.Warn().Err(err).Str("destFolderID", destFolderID).Msg("Failed to sync destination folder after copy")
+			}
+		}
+
+		// Emit event after sync completes
+		wailsRuntime.EventsEmit(a.ctx, "messages:copied", map[string]interface{}{
+			"messageIds":   messageIDs,
+			"destFolderId": destFolderID,
+		})
+	}()
+
+	return nil
+}
+
+func (a *App) copyMessagesToIMAP(messages []*message.Message, sourceFolderID string, destFolder *folder.Folder) error {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	sourceFolder, err := a.folderStore.Get(sourceFolderID)
+	if err != nil || sourceFolder == nil {
+		return fmt.Errorf("source folder not found")
+	}
+
+	poolConn, err := a.imapPool.GetConnection(a.ctx, messages[0].AccountID)
+	if err != nil {
+		return fmt.Errorf("failed to get IMAP connection: %w", err)
+	}
+	defer a.imapPool.Release(poolConn)
+
+	conn := poolConn.Client()
+
+	// Select source mailbox
+	if _, err := conn.SelectMailbox(sourceFolder.Path); err != nil {
+		return fmt.Errorf("failed to select source mailbox: %w", err)
+	}
+
+	uids := make([]goImap.UID, len(messages))
+	for i, m := range messages {
+		uids[i] = goImap.UID(m.UID)
+	}
+
+	// COPY to destination (no DELETE - messages stay in source)
+	if _, err := conn.CopyMessages(uids, destFolder.Path); err != nil {
+		return fmt.Errorf("failed to copy messages: %w", err)
+	}
+
+	return nil
+}
+
+// Archive moves messages to the Archive folder
+func (a *App) Archive(messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	// Get first message to determine account
+	messages, err := a.messageStore.GetByIDs(messageIDs[:1])
+	if err != nil || len(messages) == 0 {
+		return fmt.Errorf("failed to get message")
+	}
+
+	archiveFolder, err := a.GetSpecialFolder(messages[0].AccountID, folder.TypeArchive)
+	if err != nil {
+		return fmt.Errorf("failed to get archive folder: %w", err)
+	}
+	if archiveFolder == nil {
+		return fmt.Errorf("no archive folder configured")
+	}
+
+	return a.MoveToFolder(messageIDs, archiveFolder.ID)
+}
+
+// Trash moves messages to the Trash folder
+func (a *App) Trash(messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	messages, err := a.messageStore.GetByIDs(messageIDs[:1])
+	if err != nil || len(messages) == 0 {
+		return fmt.Errorf("failed to get message")
+	}
+
+	trashFolder, err := a.GetSpecialFolder(messages[0].AccountID, folder.TypeTrash)
+	if err != nil {
+		return fmt.Errorf("failed to get trash folder: %w", err)
+	}
+	if trashFolder == nil {
+		return fmt.Errorf("no trash folder configured")
+	}
+
+	return a.MoveToFolder(messageIDs, trashFolder.ID)
+}
+
+// MarkAsSpam moves messages to the Spam folder
+func (a *App) MarkAsSpam(messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	messages, err := a.messageStore.GetByIDs(messageIDs[:1])
+	if err != nil || len(messages) == 0 {
+		return fmt.Errorf("failed to get message")
+	}
+
+	spamFolder, err := a.GetSpecialFolder(messages[0].AccountID, folder.TypeSpam)
+	if err != nil {
+		return fmt.Errorf("failed to get spam folder: %w", err)
+	}
+	if spamFolder == nil {
+		return fmt.Errorf("no spam folder configured")
+	}
+
+	return a.MoveToFolder(messageIDs, spamFolder.ID)
+}
+
+// MarkAsNotSpam moves messages from Spam to Inbox
+func (a *App) MarkAsNotSpam(messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	messages, err := a.messageStore.GetByIDs(messageIDs[:1])
+	if err != nil || len(messages) == 0 {
+		return fmt.Errorf("failed to get message")
+	}
+
+	inboxFolder, err := a.folderStore.GetByType(messages[0].AccountID, folder.TypeInbox)
+	if err != nil {
+		return fmt.Errorf("failed to get inbox folder: %w", err)
+	}
+	if inboxFolder == nil {
+		return fmt.Errorf("no inbox folder found")
+	}
+
+	return a.MoveToFolder(messageIDs, inboxFolder.ID)
+}
+
+// DeletePermanently permanently deletes messages
+func (a *App) DeletePermanently(messageIDs []string) error {
+	log := logging.WithComponent("app")
+
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	messages, err := a.messageStore.GetByIDs(messageIDs)
+	if err != nil {
+		return fmt.Errorf("failed to get messages: %w", err)
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+
+	// Group by folder
+	byFolder := make(map[string][]*message.Message)
+	for _, m := range messages {
+		byFolder[m.FolderID] = append(byFolder[m.FolderID], m)
+	}
+
+	// Delete from local DB first
+	if err := a.messageStore.DeleteBatch(messageIDs); err != nil {
+		return fmt.Errorf("failed to delete messages locally: %w", err)
+	}
+
+	wailsRuntime.EventsEmit(a.ctx, "messages:deleted", messageIDs)
+
+	// Update folder unread counts
+	go func() {
+		folderCounts := make(map[string]int)
+		for folderID, msgs := range byFolder {
+			unreadCount, err := a.messageStore.CountUnreadByFolder(folderID)
+			if err != nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to count unread messages")
+				continue
+			}
+			folderObj, err := a.folderStore.Get(folderID)
+			if err != nil || folderObj == nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to get folder")
+				continue
+			}
+			newTotalCount := folderObj.TotalCount - len(msgs)
+			if newTotalCount < 0 {
+				newTotalCount = 0
+			}
+			if err := a.folderStore.UpdateCounts(folderID, newTotalCount, unreadCount); err != nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to update folder counts")
+				continue
+			}
+			folderCounts[folderID] = unreadCount
+		}
+		if len(folderCounts) > 0 {
+			wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", folderCounts)
+		}
+	}()
+
+	// Delete from IMAP in background
+	go func() {
+		for folderID, msgs := range byFolder {
+			if err := a.deleteMessagesFromIMAP(msgs, folderID); err != nil {
+				log.Error().Err(err).Str("folderID", folderID).Msg("Failed to delete messages from IMAP")
+			}
+		}
+	}()
+
+	// Note: Permanent delete undo is complex - would need to store full message content
+	// For now, we don't add to undo stack for permanent deletes
+
+	return nil
+}
+
+func (a *App) deleteMessagesFromIMAP(messages []*message.Message, folderID string) error {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	folderObj, err := a.folderStore.Get(folderID)
+	if err != nil || folderObj == nil {
+		return fmt.Errorf("folder not found")
+	}
+
+	poolConn, err := a.imapPool.GetConnection(a.ctx, messages[0].AccountID)
+	if err != nil {
+		return fmt.Errorf("failed to get IMAP connection: %w", err)
+	}
+	defer a.imapPool.Release(poolConn)
+
+	conn := poolConn.Client()
+	if _, err := conn.SelectMailbox(folderObj.Path); err != nil {
+		return fmt.Errorf("failed to select mailbox: %w", err)
+	}
+
+	uids := make([]goImap.UID, len(messages))
+	for i, m := range messages {
+		uids[i] = goImap.UID(m.UID)
+	}
+
+	return conn.DeleteMessagesByUID(uids)
+}
+
+// ============================================================================
+// Undo API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// Undo reverses the most recent undoable action
+// Returns the description of what was undone, or error if nothing to undo
+func (a *App) Undo() (string, error) {
+	cmd := a.undoStack.Pop()
+	if cmd == nil {
+		return "", fmt.Errorf("nothing to undo")
+	}
+
+	if err := cmd.Undo(); err != nil {
+		return "", fmt.Errorf("undo failed: %w", err)
+	}
+
+	// Emit event to refresh UI
+	wailsRuntime.EventsEmit(a.ctx, "undo:completed", cmd.Description())
+
+	return cmd.Description(), nil
+}
+
+// CanUndo returns true if there's an action that can be undone
+func (a *App) CanUndo() bool {
+	return a.undoStack.CanUndo()
+}
+
+// GetUndoDescription returns the description of what would be undone
+func (a *App) GetUndoDescription() string {
+	cmd := a.undoStack.Peek()
+	if cmd == nil {
+		return ""
+	}
+	return cmd.Description()
+}
+
+// ============================================================================
+// UndoContext Implementation - Required for undo.Command operations
+// ============================================================================
+
+// GetIMAPConnectionForUndo implements undo.UndoContext
+func (a *App) GetIMAPConnectionForUndo(ctx context.Context, accountID string) (*imap.Client, func(), error) {
+	poolConn, err := a.imapPool.GetConnection(ctx, accountID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return poolConn.Client(), func() { a.imapPool.Release(poolConn) }, nil
+}
+
+// UpdateLocalFlags implements undo.UndoContext
+func (a *App) UpdateLocalFlags(messageIDs []string, isRead, isStarred *bool) error {
+	err := a.messageStore.UpdateFlagsBatch(messageIDs, isRead, isStarred)
+	if err == nil {
+		wailsRuntime.EventsEmit(a.ctx, "messages:flagsChanged", messageIDs)
+	}
+	return err
+}
+
+// MoveLocalMessages implements undo.UndoContext
+func (a *App) MoveLocalMessages(messageIDs []string, folderID string) error {
+	err := a.messageStore.MoveMessages(messageIDs, folderID)
+	if err == nil {
+		wailsRuntime.EventsEmit(a.ctx, "messages:moved", map[string]interface{}{
+			"messageIds":   messageIDs,
+			"destFolderId": folderID,
+		})
+	}
+	return err
+}
+
+// DeleteLocalMessages implements undo.UndoContext
+func (a *App) DeleteLocalMessages(messageIDs []string) error {
+	err := a.messageStore.DeleteBatch(messageIDs)
+	if err == nil {
+		wailsRuntime.EventsEmit(a.ctx, "messages:deleted", messageIDs)
+	}
+	return err
+}
+
+// ============================================================================
+// IPC for Multi-Window Support (Detachable Composer)
+// ============================================================================
+
+// initIPC initializes the IPC server for multi-window communication.
+// This allows detached composer windows to communicate with the main window.
+func (a *App) initIPC(ctx context.Context) {
+	log := logging.WithComponent("app.ipc")
+
+	// Create token manager for secure client authentication
+	tokenMgr, err := ipc.NewTokenManager()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to create IPC token manager")
+		return
+	}
+	a.ipcTokenMgr = tokenMgr
+
+	// Create platform-specific IPC server
+	a.ipcServer = ipc.NewServer(tokenMgr)
+
+	// Register message handler
+	a.ipcServer.OnMessage(a.handleIPCMessage)
+
+	// Log the address (available immediately after NewServer)
+	log.Info().Str("address", a.ipcServer.Address()).Msg("Starting IPC server")
+
+	// Start server in background
+	go func() {
+		if err := a.ipcServer.Start(ctx); err != nil {
+			// Context cancellation is expected during shutdown
+			if ctx.Err() == nil {
+				log.Error().Err(err).Msg("IPC server error")
+			}
+		}
+	}()
+}
+
+// handleIPCMessage processes messages received from composer windows.
+func (a *App) handleIPCMessage(clientID string, msg ipc.Message) {
+	log := logging.WithComponent("app.ipc")
+
+	log.Debug().
+		Str("clientID", clientID).
+		Str("type", msg.Type).
+		Msg("Received IPC message")
+
+	switch msg.Type {
+	case ipc.TypeMessageSent:
+		var payload ipc.MessageSentPayload
+		if err := msg.ParsePayload(&payload); err != nil {
+			log.Error().Err(err).Msg("Failed to parse message_sent payload")
+			return
+		}
+		a.handleComposerMessageSent(payload)
+
+	case ipc.TypeDraftSaved:
+		var payload ipc.DraftSavedPayload
+		if err := msg.ParsePayload(&payload); err != nil {
+			log.Error().Err(err).Msg("Failed to parse draft_saved payload")
+			return
+		}
+		a.handleComposerDraftSaved(payload)
+
+	case ipc.TypeDraftDeleted:
+		var payload ipc.DraftDeletedPayload
+		if err := msg.ParsePayload(&payload); err != nil {
+			log.Error().Err(err).Msg("Failed to parse draft_deleted payload")
+			return
+		}
+		a.handleComposerDraftDeleted(payload)
+
+	case ipc.TypeComposerReady:
+		log.Info().Str("clientID", clientID).Msg("Composer window ready")
+
+	case ipc.TypeComposerClosed:
+		var payload ipc.ComposerClosedPayload
+		if err := msg.ParsePayload(&payload); err != nil {
+			log.Warn().Err(err).Msg("Failed to parse composer_closed payload")
+		}
+		log.Info().Str("clientID", clientID).Msg("Composer window closed")
+
+	default:
+		log.Warn().Str("type", msg.Type).Msg("Unknown IPC message type")
+	}
+}
+
+// handleComposerMessageSent is called when a composer successfully sends a message.
+// Emits an event to the main window frontend to show a toast and refresh folders.
+func (a *App) handleComposerMessageSent(payload ipc.MessageSentPayload) {
+	log := logging.WithComponent("app.ipc")
+
+	log.Info().
+		Str("accountID", payload.AccountID).
+		Int64("folderID", payload.FolderID).
+		Msg("Composer sent message notification")
+
+	// Emit event to frontend for toast notification and folder refresh
+	wailsRuntime.EventsEmit(a.ctx, "composer:messageSent", map[string]interface{}{
+		"accountId": payload.AccountID,
+		"folderId":  payload.FolderID,
+	})
+
+	// Sync Sent folder to pick up the new message
+	go func() {
+		if err := a.syncSentFolder(payload.AccountID); err != nil {
+			log.Warn().Err(err).Msg("Failed to sync Sent folder after composer send")
+		}
+	}()
+}
+
+// handleComposerDraftSaved is called when a composer saves a draft.
+// The composer window handles its own IMAP sync directly. We sync the Drafts
+// folder here so the main window's folder view shows the newly uploaded draft.
+func (a *App) handleComposerDraftSaved(payload ipc.DraftSavedPayload) {
+	log := logging.WithComponent("app.ipc")
+
+	log.Debug().
+		Str("accountID", payload.AccountID).
+		Str("draftID", payload.DraftID).
+		Msg("Composer saved draft notification")
+
+	// Emit event to frontend
+	wailsRuntime.EventsEmit(a.ctx, "composer:draftSaved", map[string]interface{}{
+		"accountId": payload.AccountID,
+		"draftId":   payload.DraftID,
+	})
+
+	// Sync the Drafts folder to pick up the newly uploaded draft
+	// The notification is sent after the composer's IMAP upload completes,
+	// so we can sync immediately
+	go func() {
+		draftsFolder, err := a.GetSpecialFolder(payload.AccountID, folder.TypeDrafts)
+		if err != nil || draftsFolder == nil {
+			log.Warn().Err(err).Str("accountID", payload.AccountID).Msg("Could not find Drafts folder for sync")
+			return
+		}
+
+		if err := a.SyncFolder(payload.AccountID, draftsFolder.ID); err != nil {
+			log.Warn().Err(err).Str("folderID", draftsFolder.ID).Msg("Failed to sync Drafts folder")
+			return
+		}
+
+		log.Debug().Str("folderID", draftsFolder.ID).Msg("Synced Drafts folder after composer draft save")
+	}()
+}
+
+// handleComposerDraftDeleted is called when a composer deletes a draft.
+// Syncs the Drafts folder so the main window's folder view reflects the deletion.
+func (a *App) handleComposerDraftDeleted(payload ipc.DraftDeletedPayload) {
+	log := logging.WithComponent("app.ipc")
+
+	log.Debug().
+		Str("accountID", payload.AccountID).
+		Msg("Composer deleted draft notification")
+
+	// Sync the Drafts folder to reflect the deletion
+	go func() {
+		draftsFolder, err := a.GetSpecialFolder(payload.AccountID, folder.TypeDrafts)
+		if err != nil || draftsFolder == nil {
+			log.Warn().Err(err).Str("accountID", payload.AccountID).Msg("Could not find Drafts folder for sync")
+			return
+		}
+
+		if err := a.SyncFolder(payload.AccountID, draftsFolder.ID); err != nil {
+			log.Warn().Err(err).Str("folderID", draftsFolder.ID).Msg("Failed to sync Drafts folder after deletion")
+			return
+		}
+
+		log.Debug().Str("folderID", draftsFolder.ID).Msg("Synced Drafts folder after composer draft delete")
+	}()
+}
+
+// OpenComposerWindow spawns a new detached composer window.
+// This creates a separate process of the same executable with composer mode flags.
+func (a *App) OpenComposerWindow(accountID, mode, messageID, draftID string) error {
+	log := logging.WithComponent("app.ipc")
+
+	if a.ipcServer == nil || a.ipcTokenMgr == nil {
+		return fmt.Errorf("IPC server not initialized")
+	}
+
+	execPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to get executable path: %w", err)
+	}
+
+	// Build command line arguments
+	args := []string{
+		"--compose",
+		"--account", accountID,
+		"--ipc-address", a.ipcServer.Address(),
+	}
+
+	// Add mode-specific arguments
+	if draftID != "" {
+		args = append(args, "--draft-id", draftID)
+	} else if mode != "" && mode != "new" {
+		args = append(args, "--mode", mode)
+		if messageID != "" {
+			args = append(args, "--message-id", messageID)
+		}
+	}
+
+	log.Info().
+		Str("execPath", execPath).
+		Strs("args", args).
+		Msg("Spawning composer window")
+
+	cmd := exec.Command(execPath, args...)
+
+	// Pass token securely via stdin
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+
+	// Start the process
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start composer process: %w", err)
+	}
+
+	// Write token to stdin and close immediately
+	go func() {
+		token := a.ipcTokenMgr.GetToken()
+		stdin.Write([]byte(token))
+		stdin.Close()
+	}()
+
+	log.Info().Int("pid", cmd.Process.Pid).Msg("Composer window spawned")
+
+	return nil
+}
+
+// BroadcastThemeChange notifies all composer windows that the theme has changed.
+func (a *App) BroadcastThemeChange(theme string) {
+	if a.ipcServer == nil {
+		return
+	}
+
+	msg, err := ipc.NewMessage(ipc.TypeThemeChanged, ipc.ThemeChangedPayload{
+		Theme: theme,
+	})
+	if err != nil {
+		return
+	}
+
+	a.ipcServer.Broadcast(msg)
+}
+
+// BroadcastAccountUpdated notifies all composer windows that an account was updated.
+func (a *App) BroadcastAccountUpdated(accountID string) {
+	if a.ipcServer == nil {
+		return
+	}
+
+	msg, err := ipc.NewMessage(ipc.TypeAccountUpdated, ipc.AccountUpdatedPayload{
+		AccountID: accountID,
+	})
+	if err != nil {
+		return
+	}
+
+	a.ipcServer.Broadcast(msg)
+}
+
+// BroadcastContactsUpdated notifies all composer windows that contacts were updated.
+func (a *App) BroadcastContactsUpdated(accountID string) {
+	if a.ipcServer == nil {
+		return
+	}
+
+	msg, err := ipc.NewMessage(ipc.TypeContactsUpdated, ipc.ContactsUpdatedPayload{
+		AccountID: accountID,
+	})
+	if err != nil {
+		return
+	}
+
+	a.ipcServer.Broadcast(msg)
+}
+
+// GetIPCAddress returns the IPC server address (for testing/debugging).
+func (a *App) GetIPCAddress() string {
+	if a.ipcServer == nil {
+		return ""
+	}
+	return a.ipcServer.Address()
+}
+
+// GetConnectedComposers returns the number of connected composer windows.
+func (a *App) GetConnectedComposers() int {
+	if a.ipcServer == nil {
+		return 0
+	}
+	return len(a.ipcServer.Clients())
+}
+
+// ============================================================================
+// Background Email Sync (Polling + IDLE)
+// ============================================================================
+
+// initBackgroundSync initializes and starts the background sync scheduler
+// and IMAP IDLE manager for real-time email notifications
+func (a *App) initBackgroundSync(ctx context.Context) {
+	log := logging.WithComponent("app")
+
+	// Initialize the sync scheduler for periodic polling
+	a.syncScheduler = sync.NewScheduler(a.syncEngine, a.accountStore, a.folderStore)
+
+	// Set callback for new mail notifications
+	a.syncScheduler.SetNewMailCallback(func(info sync.NewMailInfo) {
+		a.handleNewMailNotification(info)
+	})
+
+	// Start the polling scheduler
+	a.syncScheduler.Start(ctx)
+	log.Info().Msg("Email sync scheduler started")
+
+	// Initialize the IDLE manager for real-time push notifications
+	idleConfig := imap.DefaultIdleConfig()
+	a.idleManager = imap.NewIdleManager(idleConfig, a.getIMAPCredentials)
+	a.idleManager.Start(ctx)
+
+	// Start IDLE for all enabled accounts
+	accounts, err := a.accountStore.List()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to list accounts for IDLE")
+	} else {
+		for _, acc := range accounts {
+			if acc.Enabled {
+				a.idleManager.StartAccount(acc.ID, acc.Name)
+			}
+		}
+	}
+
+	// Start goroutine to process IDLE events
+	go a.processIdleEvents(ctx)
+
+	log.Info().Msg("IDLE manager started")
+}
+
+// processIdleEvents processes mail events from IDLE connections
+func (a *App) processIdleEvents(ctx context.Context) {
+	log := logging.WithComponent("app.idle")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event := <-a.idleManager.Events():
+			log.Debug().
+				Str("type", event.Type.String()).
+				Str("accountID", event.AccountID).
+				Str("folder", event.Folder).
+				Uint32("count", event.Count).
+				Msg("Received IDLE event")
+
+			switch event.Type {
+			case imap.EventNewMail:
+				// New mail arrived - trigger sync for this account's INBOX
+				go a.handleIdleNewMail(event)
+
+			case imap.EventExpunge:
+				// Message deleted - could refresh the folder view
+				// For now, just emit an event to the frontend
+				wailsRuntime.EventsEmit(a.ctx, "mail:expunge", map[string]interface{}{
+					"accountId": event.AccountID,
+					"folder":    event.Folder,
+					"seqNum":    event.SeqNum,
+				})
+
+			case imap.EventFlagsChanged:
+				// Flags changed - could refresh the message
+				wailsRuntime.EventsEmit(a.ctx, "mail:flagsChanged", map[string]interface{}{
+					"accountId": event.AccountID,
+					"folder":    event.Folder,
+					"seqNum":    event.SeqNum,
+				})
+			}
+		}
+	}
+}
+
+// handleIdleNewMail handles a new mail event from IDLE
+func (a *App) handleIdleNewMail(event imap.MailEvent) {
+	log := logging.WithComponent("app.idle")
+
+	log.Info().
+		Str("accountID", event.AccountID).
+		Uint32("count", event.Count).
+		Msg("New mail detected via IDLE, triggering sync")
+
+	// Check if a manual sync is already running - skip IDLE sync if so
+	a.syncMu.Lock()
+	if _, exists := a.syncContexts[event.AccountID]; exists {
+		a.syncMu.Unlock()
+		log.Debug().Str("account", event.AccountID).Msg("Skipping IDLE sync - sync already in progress")
+		return
+	}
+	a.syncMu.Unlock()
+
+	// Get the INBOX folder ID for events
+	inbox, _ := a.folderStore.GetByType(event.AccountID, folder.TypeInbox)
+	var folderID string
+	if inbox != nil {
+		folderID = inbox.ID
+	}
+
+	// Use the scheduler's blocking sync to get new mail info
+	newMailInfo, err := a.syncScheduler.SyncAccountInboxBlocking(event.AccountID)
+
+	if err != nil {
+		log.Error().Err(err).Str("accountID", event.AccountID).Msg("Failed to sync after IDLE notification")
+		// Emit folder:synced to clear syncing state even on error
+		if folderID != "" {
+			wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+				"accountId": event.AccountID,
+				"folderId":  folderID,
+			})
+		}
+		return
+	}
+
+	// Fetch bodies in background (same as SyncFolder does)
+	if folderID != "" {
+		// Get account's sync period
+		syncPeriodDays := 30 // default
+		if acc, accErr := a.accountStore.Get(event.AccountID); accErr == nil && acc != nil {
+			syncPeriodDays = acc.SyncPeriodDays
+		}
+
+		// Register IDLE sync context so manual sync can cancel it
+		a.syncMu.Lock()
+		// Double-check no sync started while we were processing
+		if _, exists := a.syncContexts[event.AccountID]; exists {
+			a.syncMu.Unlock()
+			log.Debug().Str("account", event.AccountID).Msg("Skipping IDLE body fetch - sync started during processing")
+			return
+		}
+		ctx, cancel := context.WithCancel(a.ctx)
+		a.syncContexts[event.AccountID] = cancel
+		a.syncMu.Unlock()
+
+		go func(syncCtx context.Context, syncDays int, fID string) {
+			// Cleanup context on completion
+			defer func() {
+				a.syncMu.Lock()
+				delete(a.syncContexts, event.AccountID)
+				a.syncMu.Unlock()
+
+				// Also emit messages:updated so the message list refreshes
+				wailsRuntime.EventsEmit(a.ctx, "messages:updated", map[string]interface{}{
+					"accountId": event.AccountID,
+					"folderId":  fID,
+				})
+				// Emit folder counts changed so sidebar unread badge updates
+				if updatedFolder, err := a.folderStore.Get(fID); err == nil && updatedFolder != nil {
+					wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", map[string]int{
+						fID: updatedFolder.UnreadCount,
+					})
+				}
+			}()
+
+			bodyErr := a.syncEngine.FetchBodiesInBackground(syncCtx, event.AccountID, fID, syncDays)
+			if bodyErr != nil {
+				if syncCtx.Err() != nil {
+					// Cancelled - not an error, emit synced
+					log.Debug().Str("folder", fID).Msg("IDLE body fetch cancelled")
+					wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+						"accountId": event.AccountID,
+						"folderId":  fID,
+					})
+				} else {
+					// Actual error - emit error event
+					log.Error().Err(bodyErr).Str("folder", fID).Msg("Background body fetch failed after IDLE sync")
+					wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
+						"accountId": event.AccountID,
+						"folderId":  fID,
+						"error":     bodyErr.Error(),
+					})
+				}
+			} else {
+				// Success
+				wailsRuntime.EventsEmit(a.ctx, "folder:synced", map[string]interface{}{
+					"accountId": event.AccountID,
+					"folderId":  fID,
+				})
+			}
+		}(ctx, syncPeriodDays, folderID)
+	}
+
+	// Notify about new mail if any
+	if newMailInfo != nil && newMailInfo.Count > 0 {
+		a.handleNewMailNotification(*newMailInfo)
+	}
+}
+
+// handleNewMailNotification handles notifications for new mail
+func (a *App) handleNewMailNotification(info sync.NewMailInfo) {
+	log := logging.WithComponent("app.notify")
+
+	log.Info().
+		Str("account", info.AccountName).
+		Int("count", info.Count).
+		Msg("New mail notification")
+
+	// Get the most recent unread message for the notification
+	var subject, fromName, fromEmail string
+
+	inbox, err := a.folderStore.GetByType(info.AccountID, folder.TypeInbox)
+	if err == nil && inbox != nil {
+		// Get the most recent unread message
+		messages, err := a.messageStore.ListByFolder(info.FolderID, 0, 1)
+		if err == nil && len(messages) > 0 {
+			msg := messages[0]
+			subject = msg.Subject
+			fromName = msg.FromName
+			fromEmail = msg.FromEmail
+		}
+	}
+
+	// Emit event to frontend for UI updates
+	wailsRuntime.EventsEmit(a.ctx, "mail:newMail", map[string]interface{}{
+		"accountId":   info.AccountID,
+		"accountName": info.AccountName,
+		"folderId":    info.FolderID,
+		"count":       info.Count,
+		"subject":     subject,
+		"fromName":    fromName,
+		"fromEmail":   fromEmail,
+	})
+
+	// Send system notification
+	a.sendSystemNotification(info, subject, fromName, fromEmail)
+}
+
+// sendSystemNotification sends a desktop notification for new mail
+func (a *App) sendSystemNotification(info sync.NewMailInfo, subject, fromName, fromEmail string) {
+	log := logging.WithComponent("app.notify")
+
+	// Build notification title and body
+	var title, body string
+
+	if info.Count == 1 && subject != "" {
+		// Single message notification
+		sender := fromName
+		if sender == "" {
+			sender = fromEmail
+		}
+		title = fmt.Sprintf("New email from %s", sender)
+		body = subject
+	} else {
+		// Multiple messages notification
+		title = fmt.Sprintf("%d new emails", info.Count)
+		body = fmt.Sprintf("in %s", info.AccountName)
+	}
+
+	// Use notify-send on Linux (most common)
+	switch runtime.GOOS {
+	case "linux":
+		cmd := exec.Command("notify-send",
+			"--app-name=Aerion",
+			"--icon=mail-unread",
+			title,
+			body,
+		)
+		if err := cmd.Run(); err != nil {
+			log.Debug().Err(err).Msg("Failed to send notification via notify-send")
+		}
+	case "darwin":
+		// macOS: use osascript for notifications
+		script := fmt.Sprintf(`display notification "%s" with title "%s"`, body, title)
+		cmd := exec.Command("osascript", "-e", script)
+		if err := cmd.Run(); err != nil {
+			log.Debug().Err(err).Msg("Failed to send notification via osascript")
+		}
+	case "windows":
+		// Windows: could use PowerShell or a library
+		// For now, just log
+		log.Debug().Str("title", title).Str("body", body).Msg("Windows notification (not implemented)")
+	}
+}
+
+// ============================================================================
+// UI State Persistence
+// ============================================================================
+
+// GetUIState retrieves the last saved UI state
+func (a *App) GetUIState() (*appstate.UIState, error) {
+	return a.appStateStore.GetUIState()
+}
+
+// SaveUIState persists the current UI state
+func (a *App) SaveUIState(state *appstate.UIState) error {
+	return a.appStateStore.SaveUIState(state)
+}
+
+// ============================================================================
+// App Info API - Exposed to frontend via Wails bindings
+// ============================================================================
+
+// AppInfo contains application metadata
+type AppInfo struct {
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Description string `json:"description"`
+	Website     string `json:"website"`
+	License     string `json:"license"`
+}
+
+// GetAppInfo returns application metadata for the About dialog
+func (a *App) GetAppInfo() AppInfo {
+	return AppInfo{
+		Name:        "Aerion",
+		Version:     "0.1.0",
+		Description: "A modern, cross-platform email client",
+		Website:     "https://github.com/hkdb/aerion",
+		License:     "Apache 2.0",
+	}
+}
+
+// GetPendingMailto returns and clears any pending mailto: URL data.
+// This is used when Aerion is launched with a mailto: URL argument.
+func (a *App) GetPendingMailto() *MailtoData {
+	data := a.pendingMailto
+	a.pendingMailto = nil // Clear after reading
+	return data
+}
+
+// ============================================================================
+// Sleep/Wake Detection for Auto-Sync
+// ============================================================================
+
+// initSleepWakeMonitor initializes the sleep/wake monitor for auto-sync on wake
+func (a *App) initSleepWakeMonitor(ctx context.Context) {
+	log := logging.WithComponent("app.sleep-wake")
+
+	// Create the platform-specific monitor
+	a.sleepWakeMonitor = platform.NewSleepWakeMonitor()
+
+	// Start the monitor
+	if err := a.sleepWakeMonitor.Start(ctx); err != nil {
+		log.Warn().Err(err).Msg("Failed to start sleep/wake monitor - auto-sync on wake disabled")
+		return
+	}
+
+	// Process events in background
+	go a.processSleepWakeEvents(ctx)
+
+	log.Info().Msg("Sleep/wake monitor initialized")
+}
+
+// processSleepWakeEvents handles sleep/wake events from the monitor
+func (a *App) processSleepWakeEvents(ctx context.Context) {
+	if a.sleepWakeMonitor == nil {
+		return
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-a.sleepWakeMonitor.Events():
+			if !ok {
+				return
+			}
+
+			if event.IsSleeping {
+				a.handleSystemSleep()
+			} else {
+				a.handleSystemWake()
+			}
+		}
+	}
+}
+
+// handleSystemSleep handles system going to sleep
+// Gracefully disconnects IMAP connections to avoid stale connection errors on wake
+func (a *App) handleSystemSleep() {
+	log := logging.WithComponent("app.sleep-wake")
+	log.Info().Msg("System going to sleep - disconnecting IMAP connections")
+
+	// Stop all IDLE connections gracefully
+	if a.idleManager != nil {
+		a.idleManager.Stop()
+	}
+
+	// Close all IMAP pool connections to avoid stale connections on wake
+	if a.imapPool != nil {
+		a.imapPool.CloseAll()
+	}
+
+	log.Info().Msg("IMAP connections closed for sleep")
+}
+
+// handleSystemWake handles system waking from sleep
+// Waits for network, restarts IDLE connections, and syncs all accounts
+func (a *App) handleSystemWake() {
+	log := logging.WithComponent("app.sleep-wake")
+	log.Info().Msg("System woke from sleep - waiting for network...")
+
+	// Wait for network to be available (3 seconds)
+	time.Sleep(3 * time.Second)
+
+	log.Info().Msg("Restarting IDLE connections and syncing all accounts")
+
+	// Restart IDLE manager
+	if a.idleManager != nil {
+		a.idleManager.Start(a.ctx)
+
+		// Restart IDLE for all enabled accounts
+		accounts, err := a.accountStore.List()
+		if err == nil {
+			for _, acc := range accounts {
+				if acc.Enabled {
+					a.idleManager.StartAccount(acc.ID, acc.Name)
+				}
+			}
+			log.Info().Int("accounts", len(accounts)).Msg("IDLE restarted for accounts")
+		}
+	}
+
+	// Trigger master sync for all accounts (same as manual sync button)
+	// Run in goroutine since SyncAllComplete is blocking
+	go func() {
+		if err := a.SyncAllComplete(); err != nil {
+			log.Warn().Err(err).Msg("Post-wake sync encountered errors")
+		} else {
+			log.Info().Msg("Post-wake sync completed successfully")
+		}
+	}()
+
+	log.Info().Msg("Post-wake sync triggered for all accounts")
+}

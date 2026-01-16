@@ -1,0 +1,198 @@
+<script lang="ts">
+  import { onMount } from 'svelte'
+  import Icon from '@iconify/svelte'
+  import * as Dialog from '$lib/components/ui/dialog'
+  import * as Tabs from '$lib/components/ui/tabs'
+  import { Button } from '$lib/components/ui/button'
+  // @ts-ignore - wailsjs path
+  import { GetReadReceiptResponsePolicy, SetReadReceiptResponsePolicy, GetMarkAsReadDelay, SetMarkAsReadDelay, GetMessageListDensity, SetMessageListDensity, GetThemeMode, SetThemeMode } from '../../../../wailsjs/go/app/App.js'
+  import { addToast } from '$lib/stores/toast'
+  import { setMessageListDensity as updateDensityStore, setThemeMode as updateThemeStore, type MessageListDensity, type ThemeMode } from '$lib/stores/settings.svelte'
+  import GeneralTab from './GeneralTab.svelte'
+  import AccountsTab from './AccountsTab.svelte'
+  import ContactsTab from './ContactsTab.svelte'
+  import AboutTab from './AboutTab.svelte'
+
+  interface Props {
+    /** Whether the dialog is open */
+    open?: boolean
+    /** Callback when dialog should close */
+    onClose?: () => void
+  }
+
+  let {
+    open = $bindable(false),
+    onClose,
+  }: Props = $props()
+
+  // Settings state
+  let readReceiptResponsePolicy = $state<string>('ask')
+  let markAsReadDelaySeconds = $state<number>(1) // Display in seconds, store in ms
+  let messageListDensity = $state<string>('standard')
+  let themeMode = $state<string>('system')
+  let loading = $state(true)
+  let saving = $state(false)
+  let activeTab = $state('general')
+
+  // Load settings on mount
+  onMount(async () => {
+    await loadSettings()
+  })
+
+  // Also load when dialog opens
+  $effect(() => {
+    if (open) {
+      loadSettings()
+    }
+  })
+
+  async function loadSettings() {
+    loading = true
+    try {
+      const [policy, delayMs, density, theme] = await Promise.all([
+        GetReadReceiptResponsePolicy(),
+        GetMarkAsReadDelay(),
+        GetMessageListDensity(),
+        GetThemeMode(),
+      ])
+      readReceiptResponsePolicy = policy
+      // Convert ms to seconds for display
+      markAsReadDelaySeconds = delayMs < 0 ? -1 : delayMs / 1000
+      messageListDensity = density
+      themeMode = theme
+    } catch (err) {
+      console.error('Failed to load settings:', err)
+    } finally {
+      loading = false
+    }
+  }
+
+  async function handleSave() {
+    saving = true
+    try {
+      // Convert seconds to ms for storage
+      const delayMs = markAsReadDelaySeconds < 0 ? -1 : Math.round(markAsReadDelaySeconds * 1000)
+
+      // Save settings sequentially to avoid SQLite lock conflicts
+      await SetReadReceiptResponsePolicy(readReceiptResponsePolicy)
+      await SetMarkAsReadDelay(delayMs)
+      await SetMessageListDensity(messageListDensity)
+      await SetThemeMode(themeMode)
+      // Update the reactive stores so UI updates immediately
+      updateDensityStore(messageListDensity as MessageListDensity)
+      updateThemeStore(themeMode as ThemeMode)
+      addToast({
+        type: 'success',
+        message: 'Settings saved',
+      })
+      open = false
+      onClose?.()
+    } catch (err) {
+      console.error('Failed to save settings:', err)
+      addToast({
+        type: 'error',
+        message: `Failed to save settings: ${err}`,
+      })
+    } finally {
+      saving = false
+    }
+  }
+
+  function handleCancel() {
+    open = false
+    onClose?.()
+  }
+
+  function handleOpenChange(isOpen: boolean) {
+    open = isOpen
+    if (!isOpen) {
+      onClose?.()
+    }
+  }
+</script>
+
+<Dialog.Root bind:open onOpenChange={handleOpenChange}>
+  <Dialog.Content class="max-w-lg" preventCloseAutoFocus>
+    <Dialog.Header>
+      <Dialog.Title>Settings</Dialog.Title>
+      <Dialog.Description>
+        Configure application preferences
+      </Dialog.Description>
+    </Dialog.Header>
+
+    {#if loading}
+      <div class="flex items-center justify-center py-8">
+        <Icon icon="mdi:loading" class="w-6 h-6 animate-spin text-muted-foreground" />
+      </div>
+    {:else}
+      <Tabs.Root bind:value={activeTab} class="w-full">
+        <Tabs.List class="grid w-full grid-cols-4">
+          <Tabs.Trigger value="general" class="flex items-center gap-2">
+            <Icon icon="mdi:cog" class="w-4 h-4" />
+            General
+          </Tabs.Trigger>
+          <Tabs.Trigger value="accounts" class="flex items-center gap-2">
+            <Icon icon="mdi:email-multiple" class="w-4 h-4" />
+            Accounts
+          </Tabs.Trigger>
+          <Tabs.Trigger value="contacts" class="flex items-center gap-2">
+            <Icon icon="mdi:contacts" class="w-4 h-4" />
+            Contacts
+          </Tabs.Trigger>
+          <Tabs.Trigger value="about" class="flex items-center gap-2">
+            <Icon icon="mdi:information-outline" class="w-4 h-4" />
+            About
+          </Tabs.Trigger>
+        </Tabs.List>
+
+        <div class="mt-4 h-[350px] overflow-y-auto">
+          <Tabs.Content value="general" class="mt-0">
+            <GeneralTab
+              bind:readReceiptResponsePolicy
+              bind:markAsReadDelaySeconds
+              bind:messageListDensity
+              bind:themeMode
+              onPolicyChange={(v) => readReceiptResponsePolicy = v}
+              onDelayChange={(v) => markAsReadDelaySeconds = v}
+              onDensityChange={(v) => messageListDensity = v}
+              onThemeChange={(v) => themeMode = v}
+            />
+          </Tabs.Content>
+
+          <Tabs.Content value="accounts" class="mt-0">
+            <AccountsTab />
+          </Tabs.Content>
+
+          <Tabs.Content value="contacts" class="mt-0">
+            <ContactsTab />
+          </Tabs.Content>
+
+          <Tabs.Content value="about" class="mt-0">
+            <AboutTab />
+          </Tabs.Content>
+        </div>
+      </Tabs.Root>
+
+      <!-- Actions - only show Save/Cancel on General tab -->
+      {#if activeTab === 'general'}
+        <div class="flex items-center justify-end gap-2 pt-4 border-t border-border">
+          <Button variant="ghost" onclick={handleCancel} disabled={saving}>
+            Cancel
+          </Button>
+          <Button onclick={handleSave} disabled={saving}>
+            {#if saving}
+              <Icon icon="mdi:loading" class="w-4 h-4 mr-2 animate-spin" />
+            {/if}
+            Save
+          </Button>
+        </div>
+      {:else}
+        <div class="flex items-center justify-end gap-2 pt-4 border-t border-border">
+          <Button variant="ghost" onclick={handleCancel}>
+            Close
+          </Button>
+        </div>
+      {/if}
+    {/if}
+  </Dialog.Content>
+</Dialog.Root>

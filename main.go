@@ -1,0 +1,279 @@
+package main
+
+import (
+	"embed"
+	"flag"
+	"io/fs"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+
+	"github.com/hkdb/aerion/app"
+	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/linux"
+)
+
+//go:embed all:frontend/dist
+var assets embed.FS
+
+// Command-line flags
+var (
+	debugMode   = flag.Bool("debug", false, "Enable debug logging")
+	composeMode = flag.Bool("compose", false, "Run in composer mode (detached window)")
+	accountID   = flag.String("account", "", "Account ID for composer")
+	ipcAddress  = flag.String("ipc-address", "", "IPC server address to connect to")
+	mode        = flag.String("mode", "new", "Compose mode: new, reply, reply-all, forward")
+	messageID   = flag.String("message-id", "", "Original message ID for reply/forward")
+	draftID     = flag.String("draft-id", "", "Draft ID to resume editing")
+)
+
+// DebugMode returns whether debug logging is enabled
+// Can be enabled via --debug flag or AERION_DEBUG=1 environment variable
+func DebugMode() bool {
+	return *debugMode || os.Getenv("AERION_DEBUG") == "1"
+}
+
+// parseMailtoURL parses a mailto: URL and extracts email data
+// Format: mailto:addr1,addr2?subject=...&body=...&cc=...&bcc=...
+func parseMailtoURL(rawURL string) *app.MailtoData {
+	if !strings.HasPrefix(strings.ToLower(rawURL), "mailto:") {
+		return nil
+	}
+
+	data := &app.MailtoData{}
+
+	// Remove mailto: prefix
+	rest := rawURL[7:]
+
+	// Split into address part and query part
+	queryStart := strings.Index(rest, "?")
+	var addrPart, queryPart string
+	if queryStart == -1 {
+		addrPart = rest
+	} else {
+		addrPart = rest[:queryStart]
+		queryPart = rest[queryStart+1:]
+	}
+
+	// Parse To addresses (comma-separated, URL-encoded)
+	if addrPart != "" {
+		decoded, err := url.QueryUnescape(addrPart)
+		if err == nil {
+			addrPart = decoded
+		}
+		// Split by comma and trim whitespace
+		for _, addr := range strings.Split(addrPart, ",") {
+			addr = strings.TrimSpace(addr)
+			if addr != "" {
+				data.To = append(data.To, addr)
+			}
+		}
+	}
+
+	// Parse query parameters
+	if queryPart != "" {
+		params, err := url.ParseQuery(queryPart)
+		if err == nil {
+			if subject := params.Get("subject"); subject != "" {
+				data.Subject = subject
+			}
+			if body := params.Get("body"); body != "" {
+				data.Body = body
+			}
+			if cc := params.Get("cc"); cc != "" {
+				for _, addr := range strings.Split(cc, ",") {
+					addr = strings.TrimSpace(addr)
+					if addr != "" {
+						data.Cc = append(data.Cc, addr)
+					}
+				}
+			}
+			if bcc := params.Get("bcc"); bcc != "" {
+				for _, addr := range strings.Split(bcc, ",") {
+					addr = strings.TrimSpace(addr)
+					if addr != "" {
+						data.Bcc = append(data.Bcc, addr)
+					}
+				}
+			}
+		}
+	}
+
+	return data
+}
+
+func main() {
+	flag.Parse()
+
+	// Check for mailto: URL in non-flag arguments
+	var mailtoData *app.MailtoData
+	args := flag.Args()
+	for _, arg := range args {
+		if strings.HasPrefix(strings.ToLower(arg), "mailto:") {
+			mailtoData = parseMailtoURL(arg)
+			break
+		}
+	}
+
+	if *composeMode {
+		runComposerMode()
+	} else {
+		runMainMode(mailtoData)
+	}
+}
+
+// runMainMode runs the main application window
+func runMainMode(mailtoData *app.MailtoData) {
+	// Create an instance of the app structure
+	application := app.NewApp(DebugMode)
+
+	// Store mailto data if provided (will be used after startup)
+	if mailtoData != nil {
+		application.PendingMailto = mailtoData
+	}
+
+	// Create a dummy ComposerApp for binding generation only.
+	// Wails generates JS/TS bindings at build time based on bound structs.
+	// We need ComposerApp bindings for the detached composer window.
+	dummyComposerApp := app.NewComposerApp(app.ComposerConfig{}, DebugMode)
+
+	// Create application with options
+	err := wails.Run(&options.App{
+		Title:       "Aerion",
+		Width:       1280,
+		Height:      800,
+		MinWidth:    800,
+		MinHeight:   600,
+		Frameless:   true,
+		StartHidden: true, // Hide until frontend is ready to prevent white flash
+		AssetServer: &assetserver.Options{
+			Assets: assets,
+		},
+		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
+		OnStartup:        application.Startup,
+		OnShutdown:       application.Shutdown,
+		OnBeforeClose:    application.BeforeClose,
+		Bind: []interface{}{
+			application,
+			dummyComposerApp, // For binding generation
+		},
+		Linux: &linux.Options{
+			WebviewGpuPolicy: linux.WebviewGpuPolicyOnDemand,
+			ProgramName:      "Aerion",
+		},
+	})
+
+	if err != nil {
+		println("Error:", err.Error())
+	}
+}
+
+// runComposerMode runs a detached composer window
+func runComposerMode() {
+	// Validate required flags
+	if *accountID == "" {
+		println("Error: --account is required for composer mode")
+		os.Exit(1)
+	}
+	if *ipcAddress == "" {
+		println("Error: --ipc-address is required for composer mode")
+		os.Exit(1)
+	}
+
+	// Create composer configuration
+	config := app.ComposerConfig{
+		AccountID:  *accountID,
+		IPCAddress: *ipcAddress,
+		Mode:       *mode,
+		MessageID:  *messageID,
+		DraftID:    *draftID,
+	}
+
+	// Create composer app
+	composerApp := app.NewComposerApp(config, DebugMode)
+
+	// Determine window title based on mode
+	title := "New Message"
+	switch *mode {
+	case "reply":
+		title = "Reply"
+	case "reply-all":
+		title = "Reply All"
+	case "forward":
+		title = "Forward"
+	}
+	if *draftID != "" {
+		title = "Edit Draft"
+	}
+
+	// Create a custom asset handler that serves composer.html instead of index.html
+	composerAssetHandler := &composerAssetHandler{assets: assets}
+
+	// Run Wails application for composer window
+	err := wails.Run(&options.App{
+		Title:       title,
+		Width:       800,
+		Height:      600,
+		MinWidth:    500,
+		MinHeight:   400,
+		Frameless:   true,
+		StartHidden: true, // Hide until frontend is ready to prevent white flash
+		AssetServer: &assetserver.Options{
+			// Don't provide Assets here - we use Handler exclusively
+			// so we can rewrite "/" to "/composer.html"
+			Handler: composerAssetHandler,
+		},
+		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
+		OnStartup:        composerApp.Startup,
+		OnShutdown:       composerApp.Shutdown,
+		Bind: []interface{}{
+			composerApp,
+		},
+		Linux: &linux.Options{
+			WebviewGpuPolicy: linux.WebviewGpuPolicyOnDemand,
+			ProgramName:      "Aerion Composer",
+		},
+	})
+
+	if err != nil {
+		println("Error:", err.Error())
+		os.Exit(1)
+	}
+}
+
+// composerAssetHandler serves composer.html instead of index.html for the root request.
+type composerAssetHandler struct {
+	assets embed.FS
+}
+
+// ServeHTTP implements http.Handler.
+// It intercepts requests for "/" and serves composer.html instead.
+func (h *composerAssetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+
+	// Rewrite root path to composer.html
+	if path == "/" || path == "" || path == "/index.html" {
+		path = "/composer.html"
+	}
+
+	// Try to read from the embedded filesystem
+	subFS, err := fs.Sub(h.assets, "frontend/dist")
+	if err != nil {
+		http.Error(w, "Asset not found", http.StatusNotFound)
+		return
+	}
+
+	// Create a modified request with the rewritten path
+	// This is necessary because http.FileServer uses r.URL.Path
+	modifiedReq := new(http.Request)
+	*modifiedReq = *r
+	modifiedReq.URL = new(url.URL)
+	*modifiedReq.URL = *r.URL
+	modifiedReq.URL.Path = path
+
+	// Serve the file with the modified request
+	http.FileServer(http.FS(subFS)).ServeHTTP(w, modifiedReq)
+}

@@ -1,0 +1,235 @@
+// Package settings provides global application settings storage
+package settings
+
+import (
+	"database/sql"
+	"fmt"
+	"strconv"
+
+	"github.com/hkdb/aerion/internal/database"
+	"github.com/hkdb/aerion/internal/logging"
+	"github.com/rs/zerolog"
+)
+
+// Known setting keys
+const (
+	KeyReadReceiptResponsePolicy = "read_receipt_response_policy"
+	KeyMarkAsReadDelay           = "mark_as_read_delay"
+	KeyMessageListDensity        = "message_list_density"
+	KeyMessageListSortOrder      = "message_list_sort_order"
+	KeyThemeMode                 = "theme_mode"
+	KeyTermsAccepted             = "terms_accepted"
+)
+
+// Density values for message list
+const (
+	DensityMicro    = "micro"
+	DensityCompact  = "compact"
+	DensityStandard = "standard"
+	DensityLarge    = "large"
+)
+
+// DefaultMessageListDensity is the default density
+const DefaultMessageListDensity = DensityStandard
+
+// Sort order values for message list
+const (
+	SortOrderNewest = "newest"
+	SortOrderOldest = "oldest"
+)
+
+// DefaultMessageListSortOrder is the default sort order
+const DefaultMessageListSortOrder = SortOrderNewest
+
+// Theme mode values
+const (
+	ThemeModeSystem = "system"
+	ThemeModeLight  = "light"
+	ThemeModeDark   = "dark"
+)
+
+// DefaultThemeMode is the default theme mode
+const DefaultThemeMode = ThemeModeSystem
+
+// Policy values for read receipts
+const (
+	PolicyNever  = "never"
+	PolicyAsk    = "ask"
+	PolicyAlways = "always"
+)
+
+// Default mark as read delay in milliseconds (1 second)
+const DefaultMarkAsReadDelay = 1000
+
+// Store provides settings persistence operations
+type Store struct {
+	db  *database.DB
+	log zerolog.Logger
+}
+
+// NewStore creates a new settings store
+func NewStore(db *database.DB) *Store {
+	return &Store{
+		db:  db,
+		log: logging.WithComponent("settings-store"),
+	}
+}
+
+// Get retrieves a setting value by key
+func (s *Store) Get(key string) (string, error) {
+	var value string
+	err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get setting %s: %w", key, err)
+	}
+	return value, nil
+}
+
+// Set sets a setting value
+func (s *Store) Set(key, value string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, key, value)
+	if err != nil {
+		return fmt.Errorf("failed to set setting %s: %w", key, err)
+	}
+
+	s.log.Debug().Str("key", key).Str("value", value).Msg("Setting updated")
+	return nil
+}
+
+// GetReadReceiptResponsePolicy returns the current read receipt response policy
+func (s *Store) GetReadReceiptResponsePolicy() (string, error) {
+	value, err := s.Get(KeyReadReceiptResponsePolicy)
+	if err != nil {
+		return PolicyAsk, err
+	}
+	if value == "" {
+		return PolicyAsk, nil // Default
+	}
+	return value, nil
+}
+
+// SetReadReceiptResponsePolicy sets the read receipt response policy
+func (s *Store) SetReadReceiptResponsePolicy(policy string) error {
+	// Validate policy
+	if policy != PolicyNever && policy != PolicyAsk && policy != PolicyAlways {
+		return fmt.Errorf("invalid policy: %s (must be 'never', 'ask', or 'always')", policy)
+	}
+	return s.Set(KeyReadReceiptResponsePolicy, policy)
+}
+
+// GetMarkAsReadDelay returns the delay before marking messages as read (in milliseconds)
+// Returns: -1 = manual only, 0 = immediate, >0 = delay in ms
+func (s *Store) GetMarkAsReadDelay() (int, error) {
+	value, err := s.Get(KeyMarkAsReadDelay)
+	if err != nil {
+		return DefaultMarkAsReadDelay, err
+	}
+	if value == "" {
+		return DefaultMarkAsReadDelay, nil
+	}
+	delay, err := strconv.Atoi(value)
+	if err != nil {
+		return DefaultMarkAsReadDelay, nil
+	}
+	return delay, nil
+}
+
+// SetMarkAsReadDelay sets the delay before marking messages as read (in milliseconds)
+// Valid values: -1 (manual only), 0 (immediate), or 100-5000 (delay in ms)
+func (s *Store) SetMarkAsReadDelay(delayMs int) error {
+	// Validate delay
+	if delayMs < -1 {
+		return fmt.Errorf("invalid delay: %d (must be -1, 0, or 100-5000)", delayMs)
+	}
+	if delayMs > 0 && delayMs < 100 {
+		return fmt.Errorf("invalid delay: %d (minimum non-zero delay is 100ms)", delayMs)
+	}
+	if delayMs > 5000 {
+		return fmt.Errorf("invalid delay: %d (maximum delay is 5000ms)", delayMs)
+	}
+	return s.Set(KeyMarkAsReadDelay, strconv.Itoa(delayMs))
+}
+
+// GetMessageListDensity returns the current message list density setting
+func (s *Store) GetMessageListDensity() (string, error) {
+	value, err := s.Get(KeyMessageListDensity)
+	if err != nil {
+		return DefaultMessageListDensity, err
+	}
+	if value == "" {
+		return DefaultMessageListDensity, nil
+	}
+	return value, nil
+}
+
+// SetMessageListDensity sets the message list density
+func (s *Store) SetMessageListDensity(density string) error {
+	if density != DensityMicro && density != DensityCompact && density != DensityStandard && density != DensityLarge {
+		return fmt.Errorf("invalid density: %s (must be 'micro', 'compact', 'standard', or 'large')", density)
+	}
+	return s.Set(KeyMessageListDensity, density)
+}
+
+// GetMessageListSortOrder returns the current message list sort order
+func (s *Store) GetMessageListSortOrder() (string, error) {
+	value, err := s.Get(KeyMessageListSortOrder)
+	if err != nil {
+		return DefaultMessageListSortOrder, err
+	}
+	if value == "" {
+		return DefaultMessageListSortOrder, nil
+	}
+	return value, nil
+}
+
+// SetMessageListSortOrder sets the message list sort order
+func (s *Store) SetMessageListSortOrder(sortOrder string) error {
+	if sortOrder != SortOrderNewest && sortOrder != SortOrderOldest {
+		return fmt.Errorf("invalid sort order: %s (must be 'newest' or 'oldest')", sortOrder)
+	}
+	return s.Set(KeyMessageListSortOrder, sortOrder)
+}
+
+// GetThemeMode returns the current theme mode setting
+func (s *Store) GetThemeMode() (string, error) {
+	value, err := s.Get(KeyThemeMode)
+	if err != nil {
+		return DefaultThemeMode, err
+	}
+	if value == "" {
+		return DefaultThemeMode, nil
+	}
+	return value, nil
+}
+
+// SetThemeMode sets the theme mode
+func (s *Store) SetThemeMode(mode string) error {
+	if mode != ThemeModeSystem && mode != ThemeModeLight && mode != ThemeModeDark {
+		return fmt.Errorf("invalid theme mode: %s (must be 'system', 'light', or 'dark')", mode)
+	}
+	return s.Set(KeyThemeMode, mode)
+}
+
+// GetTermsAccepted returns whether the user has accepted the terms of service
+func (s *Store) GetTermsAccepted() (bool, error) {
+	value, err := s.Get(KeyTermsAccepted)
+	if err != nil {
+		return false, err
+	}
+	return value == "true", nil
+}
+
+// SetTermsAccepted sets whether the user has accepted the terms of service
+func (s *Store) SetTermsAccepted(accepted bool) error {
+	value := "false"
+	if accepted {
+		value = "true"
+	}
+	return s.Set(KeyTermsAccepted, value)
+}
