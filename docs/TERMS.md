@@ -1,6 +1,6 @@
 # Terms of Use
 
-**Last Updated:** January 15, 2025
+**Last Updated:** January 20, 2026
 
 ## Acceptance of Terms
 
@@ -8,7 +8,7 @@ By downloading, installing, or using Aerion ("the Application"), you agree to be
 
 ## Description of Service
 
-Aerion is an open-source desktop email client that allows you to:
+Aerion is an open-source desktop email client. The official Aerion website and online documentation is hosted at [https://aerion.3df.io](https://aerion.3df.io). Aerion allows you to:
 
 - Connect to email accounts via IMAP/SMTP
 - Send and receive emails

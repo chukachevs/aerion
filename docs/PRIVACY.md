@@ -1,10 +1,10 @@
 # Privacy Policy
 
-**Last Updated:** January 15, 2025
+**Last Updated:** January 20, 2026
 
 ## Introduction
 
-Aerion ("we," "our," or "the Application") is an open-source desktop email client. This Privacy Policy explains how Aerion handles your information. Because Aerion is a desktop application that runs entirely on your computer, our approach to privacy is fundamentally different from cloud-based services.
+Aerion ("we," "our," or "the Application") is an open-source desktop email client. The official Aerion website and online documentation is hosted at [https://aerion.3df.io](https://aerion.3df.io). This Privacy Policy explains how Aerion handles your information. Because Aerion is a desktop application that runs entirely on your computer, our approach to privacy is fundamentally different from cloud-based services.
 
 **Key Point:** Aerion does not operate any servers that collect, store, or process your data. All your information stays on your device.
 
