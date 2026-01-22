@@ -3,6 +3,7 @@
   import { BrowserOpenURL } from '../../../../wailsjs/runtime/runtime'
   import { GetInlineAttachments, IsImageAllowed, AddImageAllowlist } from '../../../../wailsjs/go/app/App'
   import { getCached, setCache } from '../../stores/inlineAttachmentCache'
+  import { setFocusedPane, focusPreviousPane, focusNextPane } from '$lib/stores/keyboard.svelte'
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
 
   interface Props {
@@ -124,6 +125,51 @@
           window.parent.postMessage({ type: 'open-link', url: link.href }, '*');
         }
       });
+
+      // Forward keyboard events to parent for global shortcuts (only modifier keys and Escape)
+      document.addEventListener('keydown', function(e) {
+        // Only forward events that need global handling
+        if (e.altKey || e.ctrlKey || e.metaKey || e.key === 'Escape') {
+          // For pane navigation, blur inside iframe first
+          if (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'h' || e.key === 'l')) {
+            if (document.activeElement) {
+              document.activeElement.blur();
+            }
+            document.body.blur();
+            window.blur();
+          }
+          window.parent.postMessage({
+            type: 'iframe-keydown',
+            key: e.key,
+            code: e.code,
+            altKey: e.altKey,
+            ctrlKey: e.ctrlKey,
+            metaKey: e.metaKey,
+            shiftKey: e.shiftKey
+          }, '*');
+        }
+      });
+
+      // Notify parent when iframe receives focus/click (but not for links/buttons)
+      function isInteractiveElement(el) {
+        if (!el) return false;
+        var link = el.closest('a');
+        if (link && link.href) return true;
+        var button = el.closest('button');
+        if (button) return true;
+        if (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') return true;
+        return false;
+      }
+      document.addEventListener('click', function(e) {
+        if (!isInteractiveElement(e.target)) {
+          window.parent.postMessage({ type: 'iframe-focus' }, '*');
+        }
+      });
+      document.addEventListener('focus', function(e) {
+        if (!isInteractiveElement(e.target)) {
+          window.parent.postMessage({ type: 'iframe-focus' }, '*');
+        }
+      }, true);
     `
     
     return `<!DOCTYPE html>
@@ -180,6 +226,36 @@ ${processedHtml}
         // Open external links in system browser
         BrowserOpenURL(url)
       }
+    } else if (event.data?.type === 'iframe-keydown') {
+      // Handle Alt+arrow/hjkl directly for pane navigation
+      if (event.data.altKey) {
+        const key = event.data.key
+        if (key === 'ArrowLeft' || key === 'h') {
+          focusPreviousPane()
+          // Dispatch event to let App.svelte handle focus
+          window.dispatchEvent(new CustomEvent('escape-iframe-focus'))
+          return
+        } else if (key === 'ArrowRight' || key === 'l') {
+          focusNextPane()
+          window.dispatchEvent(new CustomEvent('escape-iframe-focus'))
+          return
+        }
+      }
+      // For other shortcuts (Ctrl+, Escape), dispatch to window
+      const syntheticEvent = new KeyboardEvent('keydown', {
+        key: event.data.key,
+        code: event.data.code,
+        altKey: event.data.altKey,
+        ctrlKey: event.data.ctrlKey,
+        metaKey: event.data.metaKey,
+        shiftKey: event.data.shiftKey,
+        bubbles: true,
+        cancelable: true
+      })
+      window.dispatchEvent(syntheticEvent)
+    } else if (event.data?.type === 'iframe-focus') {
+      // Set focus to viewer pane when iframe is clicked/focused
+      setFocusedPane('viewer')
     }
   }
 

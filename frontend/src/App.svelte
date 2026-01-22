@@ -33,6 +33,7 @@
   let sidebarRef: Sidebar | null = null
   let messageListRef: MessageList | null = null
   let viewerRef: ConversationViewer | null = null
+  let messageListContainerRef: HTMLElement | null = null
 
   // Theme state - follows stored preference or system
   let theme = $state<'light' | 'dark'>('light')
@@ -146,6 +147,13 @@
     EventsOn('app:shutting-down', () => {
       isShuttingDown = true
     })
+
+    // Listen for escape-iframe-focus event (from EmailBody when navigating away from iframe)
+    const handleEscapeIframeFocus = () => {
+      // Focus the message list container to take keyboard focus away from iframe
+      messageListContainerRef?.focus()
+    }
+    window.addEventListener('escape-iframe-focus', handleEscapeIframeFocus)
 
     // Load application settings (including theme mode) and apply theme
     const storedThemeMode = await loadSettings()
@@ -918,10 +926,12 @@
 
     <!-- Message List -->
     <section
+      bind:this={messageListContainerRef}
       class="flex-shrink-0 border-r border-border bg-background"
       style="width: {listWidth}px"
       role="presentation"
       data-pane="messageList"
+      tabindex="-1"
       onclick={() => handlePaneClick('messageList')}
     >
       <MessageList

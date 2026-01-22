@@ -12,6 +12,7 @@
   import AttachmentList from './AttachmentList.svelte'
   import EmailBody from './EmailBody.svelte'
   import { toasts } from '$lib/stores/toast'
+  import { setFocusedPane } from '$lib/stores/keyboard.svelte'
   import { ConfirmDialog } from '$lib/components/ui/confirm-dialog'
   import MessageContextMenu from '$lib/components/common/MessageContextMenu.svelte'
 
@@ -806,7 +807,7 @@
     </div>
 
     <!-- Conversation Content -->
-    <div bind:this={contentContainerRef} class="flex-1 min-h-0 overflow-y-auto scrollbar-thin">
+    <div bind:this={contentContainerRef} class="flex-1 min-h-0 overflow-y-auto scrollbar-thin" onfocusin={() => setFocusedPane('viewer')}>
       <MessageContextMenu
         messageIds={allMessageIds}
         accountId={accountId || ''}

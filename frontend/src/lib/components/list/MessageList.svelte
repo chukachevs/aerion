@@ -279,6 +279,12 @@
 
       if (currentOffset === 0) {
         conversations = convList || []
+        // Auto-select first message on fresh load for keyboard navigation
+        if (conversations.length > 0) {
+          selectedThreadId = conversations[0].threadId
+        } else {
+          selectedThreadId = null
+        }
       } else {
         conversations = [...conversations, ...(convList || [])]
       }
@@ -380,6 +386,10 @@
 
       searchResults = results || []
       searchTotalCount = count
+      // Auto-select first search result for keyboard navigation
+      if (searchResults.length > 0) {
+        selectedThreadId = searchResults[0].threadId
+      }
     } catch (err) {
       error = err instanceof Error ? err.message : String(err)
       console.error('Search failed:', err)

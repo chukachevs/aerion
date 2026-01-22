@@ -119,14 +119,7 @@ Potential features in the future:
 ### 🏷️ Changelog
 ---
 
-**01-19-2026 - v0.1.1**
-
-- Compile AppImage with Ubuntu 22.04 instead to improve compatibility with older systems
-
-
-**01-16-2026 - v0.1.0**
-
-- First release - ALPHA
+[CHANGELOG.md](CHANGELOG.md)
 
 
 ### 📑 Terms of Use & Privacy Policy
