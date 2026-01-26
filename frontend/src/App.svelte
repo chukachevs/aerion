@@ -21,7 +21,7 @@
     isInputElement 
   } from '$lib/stores/keyboard.svelte'
   // @ts-ignore - wailsjs path
-  import { PrepareReply, GetPendingMailto, GetDraft, Trash, DeletePermanently, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, Undo, GetTermsAccepted, SetTermsAccepted } from '../wailsjs/go/app/App.js'
+  import { PrepareReply, GetPendingMailto, GetDraft, Trash, DeletePermanently, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted } from '../wailsjs/go/app/App.js'
   // @ts-ignore - wailsjs path
   import { smtp, folder } from '../wailsjs/go/models'
   // @ts-ignore - wailsjs runtime
@@ -552,9 +552,23 @@
           return
         case 's':
           e.preventDefault()
-          messageListRef?.focusSearch()
-          setFocusedPane('messageList')
+          if (e.shiftKey) {
+            // Ctrl-Shift-S: Toggle sync current folder (start sync or cancel if already running)
+            messageListRef?.toggleFolderSync()
+          } else {
+            // Ctrl-S: Focus search
+            messageListRef?.focusSearch()
+            setFocusedPane('messageList')
+          }
           return
+        case 'a':
+          if (e.shiftKey) {
+            // Ctrl-Shift-A: Toggle sync all accounts (start sync or cancel if already running)
+            e.preventDefault()
+            sidebarRef?.toggleSync()
+            return
+          }
+          break
         case 'l':
           e.preventDefault()
           if (e.shiftKey) {
@@ -827,12 +841,23 @@
 
   async function handleBulkSpam(messageIds: string[]) {
     try {
-      await MarkAsSpam(messageIds)
-      addToast({ type: 'success', message: 'Marked as spam', actions: [{ label: 'Undo', onClick: handleUndo }] })
+      const isSpamFolder = selectedFolderType === 'spam'
+
+      if (isSpamFolder) {
+        // If we're in spam folder, mark as NOT spam
+        await MarkAsNotSpam(messageIds)
+        addToast({ type: 'success', message: 'Marked as not spam', actions: [{ label: 'Undo', onClick: handleUndo }] })
+      } else {
+        // Otherwise, mark as spam
+        await MarkAsSpam(messageIds)
+        addToast({ type: 'success', message: 'Marked as spam', actions: [{ label: 'Undo', onClick: handleUndo }] })
+      }
+
       messageListRef?.clearChecked()
       messageListRef?.handleActionComplete(true)
     } catch (err) {
-      addToast({ type: 'error', message: `Failed to mark as spam: ${err}` })
+      const isSpamFolder = selectedFolderType === 'spam'
+      addToast({ type: 'error', message: `Failed to ${isSpamFolder ? 'mark as not spam' : 'mark as spam'}: ${err}` })
     }
   }
 

@@ -268,6 +268,20 @@ func (a *App) SyncAllComplete() error {
 	return nil
 }
 
+// CancelFolderSync cancels a running sync for a specific folder
+func (a *App) CancelFolderSync(accountID, folderID string) {
+	log := logging.WithComponent("app")
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+
+	syncKey := accountID + ":" + folderID
+	if cancel, exists := a.syncContexts[syncKey]; exists {
+		log.Info().Str("syncKey", syncKey).Msg("Cancelling folder sync")
+		cancel()
+		delete(a.syncContexts, syncKey)
+	}
+}
+
 // CancelAccountSync cancels any running syncs for the specified account (all folders)
 func (a *App) CancelAccountSync(accountID string) {
 	log := logging.WithComponent("app")

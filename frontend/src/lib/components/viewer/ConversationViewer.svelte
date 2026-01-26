@@ -4,7 +4,7 @@
   // @ts-ignore - wailsjs bindings
   import { GetConversation, GetReadReceiptResponsePolicy, SendReadReceipt, IgnoreReadReceipt, GetMarkAsReadDelay, GetMessageSource } from '../../../../wailsjs/go/app/App'
   // @ts-ignore - wailsjs bindings
-  import { MarkAsRead, MarkAsUnread, Star, Unstar, Archive, Trash, MarkAsSpam, DeletePermanently, Undo } from '../../../../wailsjs/go/app/App'
+  import { MarkAsRead, MarkAsUnread, Star, Unstar, Archive, Trash, MarkAsSpam, MarkAsNotSpam, DeletePermanently, Undo } from '../../../../wailsjs/go/app/App'
   // @ts-ignore - wailsjs path
   import { EventsOn, EventsOff } from '../../../../wailsjs/runtime/runtime'
   // @ts-ignore - wailsjs path
@@ -417,15 +417,24 @@
   async function handleSpam() {
     if (!conversation?.messages) return
     const messageIds = conversation.messages.map(m => m.id)
-    
+
     try {
-      await MarkAsSpam(messageIds)
-      toasts.success('Marked as spam', [
-        { label: 'Undo', onClick: handleUndo }
-      ])
+      if (isSpamFolder) {
+        // If we're in spam folder, mark as NOT spam
+        await MarkAsNotSpam(messageIds)
+        toasts.success('Marked as not spam', [
+          { label: 'Undo', onClick: handleUndo }
+        ])
+      } else {
+        // Otherwise, mark as spam
+        await MarkAsSpam(messageIds)
+        toasts.success('Marked as spam', [
+          { label: 'Undo', onClick: handleUndo }
+        ])
+      }
       onActionComplete?.(true)
     } catch (err) {
-      toasts.error(`Failed to mark as spam: ${err}`)
+      toasts.error(`Failed to ${isSpamFolder ? 'mark as not spam' : 'mark as spam'}: ${err}`)
     }
   }
 
@@ -552,6 +561,9 @@
 
   // Computed: is this the Drafts folder?
   const isDraftsFolder = $derived(folderType === 'drafts')
+
+  // Computed: is this the Spam folder?
+  const isSpamFolder = $derived(folderType === 'spam')
 
   // Computed: all message IDs in the conversation (for context menu)
   const allMessageIds = $derived(
@@ -753,12 +765,12 @@
         >
           <Icon icon={isTrashFolder ? "mdi:delete-forever" : "mdi:delete-outline"} class="w-5 h-5 text-muted-foreground" />
         </button>
-        <button 
-          class="p-2 rounded-md hover:bg-muted transition-colors" 
-          title="Mark as Spam"
+        <button
+          class="p-2 rounded-md hover:bg-muted transition-colors"
+          title={isSpamFolder ? "Mark as NOT Spam" : "Mark as Spam"}
           onclick={handleSpam}
         >
-          <Icon icon="mdi:alert-octagon-outline" class="w-5 h-5 text-muted-foreground" />
+          <Icon icon={isSpamFolder ? "mdi:email-check-outline" : "mdi:alert-octagon-outline"} class="w-5 h-5 text-muted-foreground" />
         </button>
 
         <div class="w-px h-5 bg-border mx-1"></div>

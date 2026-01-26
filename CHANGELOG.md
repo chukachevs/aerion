@@ -1,5 +1,15 @@
 # CHANGELOG
 
+**v0.1.3 - 01-25-2026**
+---
+
+- Added "Mark as NOT Spam" to spam folders
+- Improved Google contact sync error handling
+- Auto-focus on the first message of search results on enter
+- Added cancel folder sync
+- Added shortcut keys for sync all accounts and folder sync
+
+
 **v0.1.2 - 01-22-2026**
 ---
 

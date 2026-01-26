@@ -18,6 +18,7 @@
     Archive,
     Trash,
     MarkAsSpam,
+    MarkAsNotSpam,
     DeletePermanently,
     MoveToFolder,
     CopyToFolder,
@@ -81,6 +82,7 @@
 
   // Computed values
   const isTrashFolder = $derived(folderType === 'trash')
+  const isSpamFolder = $derived(folderType === 'spam')
   const isSingleMessage = $derived(messageIds.length === 1)
 
   // Load folders when context menu opens
@@ -188,11 +190,18 @@
 
   async function handleSpam() {
     try {
-      await MarkAsSpam(messageIds)
-      toasts.success('Marked as spam', [{ label: 'Undo', onClick: handleUndo }])
+      if (isSpamFolder) {
+        // If we're in spam folder, mark as NOT spam
+        await MarkAsNotSpam(messageIds)
+        toasts.success('Marked as not spam', [{ label: 'Undo', onClick: handleUndo }])
+      } else {
+        // Otherwise, mark as spam
+        await MarkAsSpam(messageIds)
+        toasts.success('Marked as spam', [{ label: 'Undo', onClick: handleUndo }])
+      }
       onActionComplete?.()
     } catch (err) {
-      toasts.error(`Failed to mark as spam: ${err}`)
+      toasts.error(`Failed to ${isSpamFolder ? 'mark as not spam' : 'mark as spam'}: ${err}`)
     }
   }
 
@@ -282,8 +291,8 @@
       {isTrashFolder ? 'Delete Permanently' : 'Delete'}
     </ContextMenuItem>
     <ContextMenuItem onSelect={handleSpam}>
-      <Icon icon="mdi:alert-octagon-outline" class="mr-2 h-4 w-4" />
-      Mark as Spam
+      <Icon icon={isSpamFolder ? "mdi:email-check-outline" : "mdi:alert-octagon-outline"} class="mr-2 h-4 w-4" />
+      {isSpamFolder ? 'Mark as NOT Spam' : 'Mark as Spam'}
     </ContextMenuItem>
 
     <ContextMenuSeparator />

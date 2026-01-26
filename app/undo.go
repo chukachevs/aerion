@@ -68,14 +68,64 @@ func (a *App) UpdateLocalFlags(messageIDs []string, isRead, isStarred *bool) err
 
 // MoveLocalMessages implements undo.UndoContext
 func (a *App) MoveLocalMessages(messageIDs []string, folderID string) error {
-	err := a.messageStore.MoveMessages(messageIDs, folderID)
-	if err == nil {
-		wailsRuntime.EventsEmit(a.ctx, "messages:moved", map[string]interface{}{
-			"messageIds":   messageIDs,
-			"destFolderId": folderID,
-		})
+	// Get the source folder IDs before moving (for count updates)
+	messages, err := a.messageStore.GetByIDs(messageIDs)
+	if err != nil {
+		return fmt.Errorf("failed to get messages: %w", err)
 	}
-	return err
+
+	// Group by source folder
+	sourceFolderIDs := make(map[string]bool)
+	for _, msg := range messages {
+		sourceFolderIDs[msg.FolderID] = true
+	}
+
+	// Move messages in database
+	err = a.messageStore.MoveMessages(messageIDs, folderID)
+	if err != nil {
+		return err
+	}
+
+	// Emit messages:moved event
+	wailsRuntime.EventsEmit(a.ctx, "messages:moved", map[string]interface{}{
+		"messageIds":   messageIDs,
+		"destFolderId": folderID,
+	})
+
+	// Update folder counts for all affected folders (source + destination)
+	go func() {
+		folderCounts := make(map[string]int)
+
+		// Update source folders
+		for sourceFolderID := range sourceFolderIDs {
+			unreadCount, err := a.messageStore.CountUnreadByFolder(sourceFolderID)
+			if err == nil {
+				folderObj, err := a.folderStore.Get(sourceFolderID)
+				if err == nil && folderObj != nil {
+					totalCount, _ := a.messageStore.CountByFolder(sourceFolderID)
+					a.folderStore.UpdateCounts(sourceFolderID, totalCount, unreadCount)
+					folderCounts[sourceFolderID] = unreadCount
+				}
+			}
+		}
+
+		// Update destination folder
+		unreadCount, err := a.messageStore.CountUnreadByFolder(folderID)
+		if err == nil {
+			folderObj, err := a.folderStore.Get(folderID)
+			if err == nil && folderObj != nil {
+				totalCount, _ := a.messageStore.CountByFolder(folderID)
+				a.folderStore.UpdateCounts(folderID, totalCount, unreadCount)
+				folderCounts[folderID] = unreadCount
+			}
+		}
+
+		if len(folderCounts) > 0 {
+			wailsRuntime.EventsEmit(a.ctx, "folders:countsChanged", folderCounts)
+		}
+	}()
+
+	return nil
 }
 
 // DeleteLocalMessages implements undo.UndoContext

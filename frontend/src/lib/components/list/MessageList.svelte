@@ -5,7 +5,7 @@
   import { DropdownMenu } from 'bits-ui'
   import { cn } from '$lib/utils'
   // @ts-ignore - wailsjs bindings
-  import { GetConversations, GetConversationCount, SyncFolder, ForceSyncFolder, SetMessageListSortOrder, GetUnifiedInboxConversations, GetUnifiedInboxCount, SearchConversations, SearchUnifiedInbox, GetSearchCount, GetSearchCountUnifiedInbox, GetFTSIndexStatus, IsFTSIndexing } from '../../../../wailsjs/go/app/App'
+  import { GetConversations, GetConversationCount, SyncFolder, ForceSyncFolder, CancelFolderSync, SetMessageListSortOrder, GetUnifiedInboxConversations, GetUnifiedInboxCount, SearchConversations, SearchUnifiedInbox, GetSearchCount, GetSearchCountUnifiedInbox, GetFTSIndexStatus, IsFTSIndexing } from '../../../../wailsjs/go/app/App'
   // @ts-ignore - wailsjs path
   import { message } from '../../../../wailsjs/go/models'
   // @ts-ignore - wailsjs runtime
@@ -103,6 +103,15 @@
       }
     })
 
+    // Listen for messages:moved events (e.g., spam/not spam actions)
+    EventsOn('messages:moved', () => {
+      // Always reload when messages are moved to ensure current folder view is updated
+      // This handles cases like marking as spam/not spam where messages leave the current folder
+      const totalLoaded = Math.max(conversations.length, PAGE_SIZE)
+      offset = 0
+      loadConversations(totalLoaded)
+    })
+
     // Listen for message flag changes (e.g., marked as read)
     EventsOn('messages:flagsChanged', (data: { messageIds: string[], isRead: boolean }) => {
       // Update conversations locally instead of reloading from DB
@@ -152,6 +161,7 @@
   onDestroy(() => {
     EventsOff('folder:synced')
     EventsOff('messages:updated')
+    EventsOff('messages:moved')
     EventsOff('messages:flagsChanged')
     EventsOff('fts:progress')
     EventsOff('fts:complete')
@@ -297,7 +307,7 @@
     }
   }
 
-  async function syncFolder() {
+  export async function syncFolder() {
     // Can't sync unified inbox directly - individual folders must be synced
     if (isUnifiedView || !accountId || !folderId) return
 
@@ -314,6 +324,26 @@
       console.error('Failed to sync folder:', err)
     }
     // No need to manage syncing state - account store handles it via events
+  }
+
+  // Cancel folder sync
+  export async function cancelFolderSync() {
+    if (isUnifiedView || !accountId || !folderId) return
+
+    try {
+      await CancelFolderSync(accountId, folderId)
+    } catch (err) {
+      console.error('Failed to cancel folder sync:', err)
+    }
+  }
+
+  // Toggle folder sync (start if not running, cancel if running) - for keyboard shortcut and UI
+  export async function toggleFolderSync() {
+    if (syncing) {
+      await cancelFolderSync()
+    } else {
+      await syncFolder()
+    }
   }
 
   // Force re-sync folder (clears bodies & attachments, then re-fetches)
@@ -449,6 +479,11 @@
   function handleSearchKeydown(event: KeyboardEvent) {
     if (event.key === 'Escape') {
       clearSearch()
+    } else if (event.key === 'Enter') {
+      // Move focus from search input to message list so user can navigate with arrow keys
+      event.preventDefault()
+      searchInputRef?.blur()
+      listContainerRef?.focus()
     }
   }
 
@@ -842,8 +877,8 @@
         <!-- While syncing, show spinning icon that cancels on click -->
         <button
           class="p-2 rounded-md hover:bg-muted transition-colors"
-          title={syncProgress ? `Syncing ${syncProgress.phase}: ${syncProgress.percentage}%` : 'Syncing...'}
-          disabled
+          title={syncProgress ? `Syncing ${syncProgress.phase}: ${syncProgress.percentage}% - Click to cancel` : 'Syncing... Click to cancel'}
+          onclick={cancelFolderSync}
         >
           <Icon
             icon="mdi:refresh"

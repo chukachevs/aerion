@@ -193,7 +193,7 @@
   }
 
   // Sync all accounts (comprehensive sync)
-  async function syncAllAccounts() {
+  export async function syncAllAccounts() {
     try {
       await accountStore.syncAllComplete()
     } catch (err) {
@@ -203,11 +203,20 @@
   }
 
   // Cancel all running syncs
-  async function cancelSync() {
+  export async function cancelSync() {
     try {
       await accountStore.cancelAllSyncs()
     } catch (err) {
       console.error('Failed to cancel sync:', err)
+    }
+  }
+
+  // Toggle sync (start if not running, cancel if running) - for keyboard shortcut
+  export async function toggleSync() {
+    if (accountStore.isAnySyncing) {
+      await cancelSync()
+    } else {
+      await syncAllAccounts()
     }
   }
 

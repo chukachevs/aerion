@@ -109,6 +109,24 @@ func (s *GoogleContactsSyncer) SyncContactsDelta(accessToken, syncToken string) 
 			// Read the error response body for error handling
 			bodyBytes, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+
+			// Check for expired sync token in 400 Bad Request
+			if resp.StatusCode == http.StatusBadRequest {
+				var errorResp googleErrorResponse
+				if err := json.Unmarshal(bodyBytes, &errorResp); err == nil {
+					// Check if this is an EXPIRED_SYNC_TOKEN error
+					for _, detail := range errorResp.Error.Details {
+						if detail.Reason == "EXPIRED_SYNC_TOKEN" {
+							if !isFullSync {
+								s.log.Warn().Msg("Google sync token expired (400 EXPIRED_SYNC_TOKEN), falling back to full sync")
+								return s.SyncContactsDelta(accessToken, "")
+							}
+							return nil, fmt.Errorf("Google API returned EXPIRED_SYNC_TOKEN on full sync")
+						}
+					}
+				}
+			}
+
 			s.log.Error().
 				Int("status", resp.StatusCode).
 				Msg("Google People API error response")
@@ -216,4 +234,22 @@ type googleConnection struct {
 
 type googleConnectionMetadata struct {
 	Deleted bool `json:"deleted"` // True if contact was deleted (in incremental sync)
+}
+
+// Google API error response structures
+type googleErrorResponse struct {
+	Error googleErrorDetails `json:"error"`
+}
+
+type googleErrorDetails struct {
+	Code    int                 `json:"code"`
+	Message string              `json:"message"`
+	Status  string              `json:"status"`
+	Details []googleErrorDetail `json:"details"`
+}
+
+type googleErrorDetail struct {
+	Type   string `json:"@type"`
+	Reason string `json:"reason"` // e.g., "EXPIRED_SYNC_TOKEN"
+	Domain string `json:"domain"`
 }
