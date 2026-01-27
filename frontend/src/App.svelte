@@ -1,4 +1,7 @@
 <script lang="ts">
+  // Load offline icon data before anything else
+  import './lib/iconify-offline'
+
   import { onMount } from 'svelte'
   import TitleBar from './lib/components/common/TitleBar.svelte'
   import Sidebar from './lib/components/sidebar/Sidebar.svelte'

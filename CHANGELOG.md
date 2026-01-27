@@ -1,5 +1,12 @@
 # CHANGELOG
 
+**v0.1.5 - 01-27-2026**
+---
+
+- Bundle icons instead of downloading on launch
+- Improved AppImage compatibility
+
+
 **v0.1.4 - 01-26-2026**
 ---
 

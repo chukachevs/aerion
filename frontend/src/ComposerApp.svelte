@@ -1,4 +1,7 @@
 <script lang="ts">
+  // Load offline icon data before anything else
+  import './lib/iconify-offline'
+
   import { onMount, onDestroy } from 'svelte'
   import Icon from '@iconify/svelte'
   import Composer from './lib/components/composer/Composer.svelte'

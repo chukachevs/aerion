@@ -11,6 +11,9 @@ export default defineConfig({
       '$': path.resolve('./src'),
     },
   },
+  optimizeDeps: {
+    include: ['@iconify-json/mdi', '@iconify-json/lucide', '@iconify-json/heroicons', '@iconify-json/logos', '@iconify-json/simple-icons'],
+  },
   build: {
     target: 'esnext',
     minify: 'esbuild',

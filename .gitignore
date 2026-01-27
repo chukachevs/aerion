@@ -4,6 +4,7 @@ aerion
 
 # Wails build artifacts
 build/bin/
+build/linux/AppDir
 .tools/
 .claude
 .crush

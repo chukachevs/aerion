@@ -42,6 +42,13 @@ else
     APPIMAGE_RUNTIME := $(TOOLS_DIR)/runtime-x86_64
 endif
 
+# Detect webkit helper directory (architecture-specific)
+ifeq ($(ARCH),aarch64)
+    WEBKIT_HELPERS_DIR := /usr/lib/aarch64-linux-gnu/webkit2gtk-4.1
+else
+    WEBKIT_HELPERS_DIR := /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1
+endif
+
 # Installation directories (can be overridden)
 PREFIX ?= /usr/local
 DESTDIR ?=
@@ -83,23 +90,62 @@ $(APPIMAGE_RUNTIME):
 	curl -L --retry 3 --retry-delay 5 --connect-timeout 30 -o $(APPIMAGE_RUNTIME) \
 		https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-$(ARCH)
 
+# No longer needed - we manually bundle webkit helpers
+
 # Build Linux AppImage
 appimage: build-linux $(LINUXDEPLOY) $(APPIMAGE_RUNTIME)
 	@echo "Creating AppImage..."
-	@rm -rf $(CURDIR)/AppDir
-	@mkdir -p $(CURDIR)/AppDir/usr/bin
-	@mkdir -p $(CURDIR)/AppDir/usr/share/applications
-	@mkdir -p $(CURDIR)/AppDir/usr/share/icons/hicolor/256x256/apps
-	cp build/bin/aerion $(CURDIR)/AppDir/usr/bin/
-	cp build/linux/aerion.desktop $(CURDIR)/AppDir/usr/share/applications/
-	cp build/appicon.png $(CURDIR)/AppDir/usr/share/icons/hicolor/256x256/apps/aerion.png
-	cd $(CURDIR) && ARCH=$(ARCH) LDAI_RUNTIME_FILE=$(APPIMAGE_RUNTIME) $(LINUXDEPLOY) \
-		--appdir AppDir \
-		--desktop-file AppDir/usr/share/applications/aerion.desktop \
-		--icon-file AppDir/usr/share/icons/hicolor/256x256/apps/aerion.png \
+	@rm -rf build/linux/AppDir
+	@mkdir -p build/linux/AppDir/usr/bin
+	@mkdir -p build/linux/AppDir/usr/share/applications
+	@mkdir -p build/linux/AppDir/usr/share/icons/hicolor/256x256/apps
+	@mkdir -p build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/webkit2gtk-4.1
+	cp build/bin/aerion build/linux/AppDir/usr/bin/
+	cp build/linux/aerion.desktop build/linux/AppDir/usr/share/applications/
+	cp build/appicon.png build/linux/AppDir/usr/share/icons/hicolor/256x256/apps/aerion.png
+	@echo "Creating /lib symlink for webkit compatibility..."
+	ln -sf usr/lib build/linux/AppDir/lib
+	@echo "Bundling webkit2gtk helper processes..."
+	@if [ -d "$(WEBKIT_HELPERS_DIR)" ]; then \
+		cp -r $(WEBKIT_HELPERS_DIR)/* build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/webkit2gtk-4.1/; \
+		echo "Webkit helpers bundled from $(WEBKIT_HELPERS_DIR) to usr/lib/$(ARCH)-linux-gnu/webkit2gtk-4.1/"; \
+		echo "Creating wrapper scripts for webkit helpers..."; \
+		for helper in WebKitNetworkProcess WebKitWebProcess WebKitGPUProcess; do \
+			if [ -f "build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/webkit2gtk-4.1/$$helper" ]; then \
+				mv "build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/webkit2gtk-4.1/$$helper" \
+				   "build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/webkit2gtk-4.1/$$helper.bin"; \
+				cp build/linux/webkit-wrapper.sh "build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/webkit2gtk-4.1/$$helper"; \
+				chmod +x "build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/webkit2gtk-4.1/$$helper"; \
+			fi; \
+		done; \
+	else \
+		echo "Warning: webkit2gtk helpers not found at $(WEBKIT_HELPERS_DIR)"; \
+		echo "AppImage may not work on systems without webkit2gtk installed"; \
+	fi
+	@echo "Bundling GDK pixbuf loaders..."
+	@mkdir -p build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders
+	@if [ -d "/usr/lib/$(ARCH)-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders" ]; then \
+		cp -r /usr/lib/$(ARCH)-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/* \
+		      build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/; \
+		echo "Pixbuf loaders bundled"; \
+	fi
+	@echo "Generating pixbuf loaders cache..."
+	@GDK_PIXBUF_MODULEDIR=$(CURDIR)/build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders \
+		gdk-pixbuf-query-loaders 2>/dev/null | \
+		sed 's|$(CURDIR)/build/linux/AppDir||g' > build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache || \
+		echo "# loaders.cache" > build/linux/AppDir/usr/lib/$(ARCH)-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache
+	@echo "Preparing custom AppRun script..."
+	chmod +x build/linux/AppRun
+	cd $(CURDIR) && ARCH=$(ARCH) \
+		LDAI_RUNTIME_FILE=$(APPIMAGE_RUNTIME) \
+		$(LINUXDEPLOY) \
+		--appdir build/linux/AppDir \
+		--custom-apprun build/linux/AppRun \
+		--desktop-file build/linux/AppDir/usr/share/applications/aerion.desktop \
+		--icon-file build/linux/AppDir/usr/share/icons/hicolor/256x256/apps/aerion.png \
 		--output appimage
 	@mv Aerion-*.AppImage build/bin/ 2>/dev/null || mv aerion-*.AppImage build/bin/
-	@rm -rf $(CURDIR)/AppDir
+	@rm -rf build/linux/AppDir
 	@echo "AppImage created at build/bin/"
 
 # Run in development mode with hot reload
