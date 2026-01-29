@@ -1,5 +1,11 @@
 # CHANGELOG
 
+**v0.1.8 - 01-29-2026**
+---
+
+- Fixed AppImage support for more popular immutable/atomic distros
+
+
 **v0.1.7 - 01-29-2026**
 ---
 

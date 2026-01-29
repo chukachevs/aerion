@@ -38,14 +38,34 @@ if [ -n "$LIB_ARCH" ] && [ -d "${HERE}/usr/lib/${LIB_ARCH}" ] && command -v bwra
             --unsetenv LD_LIBRARY_PATH \
             "${HERE}/usr/bin/aerion" "$@"
     else
-        # Webkit directory doesn't exist (Void/Atomic Fedora) - bind entire arch lib directory
-        exec bwrap \
-            --dev-bind / / \
-            --bind "$HOME" "$HOME" \
-            --bind /tmp /tmp \
-            --bind "${HERE}/usr/lib/${LIB_ARCH}" "/usr/lib/${LIB_ARCH}" \
-            --unsetenv LD_LIBRARY_PATH \
-            "${HERE}/usr/bin/aerion" "$@"
+        # Webkit directory doesn't exist - need to create it
+        # Check if this is an immutable/atomic distro
+        if [ -f "/run/ostree-booted" ] || [ -f "/ostree/repo/config" ] || \
+           [ -f "/etc/NIXOS" ] || [ -f "/run/current-system/nixos-version" ] || \
+           [ -f "/usr/share/abroot/abroot.json" ] || \
+           grep -qi "immutable\|atomic\|silverblue\|kinoite\|microos\|endless" /etc/os-release 2>/dev/null; then
+            # Immutable distro (Silverblue/Kinoite/EndlessOS/NixOS/Vanilla OS/MicroOS/etc) - use tmpfs overlay for /usr/lib
+            # This creates a writable layer without affecting system libs
+            exec bwrap \
+                --ro-bind / / \
+                --dev-bind /dev /dev \
+                --proc /proc \
+                --bind "$HOME" "$HOME" \
+                --bind /tmp /tmp \
+                --tmpfs /usr/lib \
+                --ro-bind "${HERE}/usr/lib/${LIB_ARCH}" "/usr/lib/${LIB_ARCH}" \
+                --unsetenv LD_LIBRARY_PATH \
+                "${HERE}/usr/bin/aerion" "$@"
+        else
+            # Regular distro (Void/etc) - bind entire arch lib directory
+            exec bwrap \
+                --dev-bind / / \
+                --bind "$HOME" "$HOME" \
+                --bind /tmp /tmp \
+                --bind "${HERE}/usr/lib/${LIB_ARCH}" "/usr/lib/${LIB_ARCH}" \
+                --unsetenv LD_LIBRARY_PATH \
+                "${HERE}/usr/bin/aerion" "$@"
+        fi
     fi
 else
     # No bwrap - fallback, use AppImage paths
