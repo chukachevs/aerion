@@ -102,7 +102,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: aerion-${{ matrix.platform }}-${{ matrix.arch }}
+          name: aerion-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
           path: |
             build/bin/aerion-*
             build/bin/Aerion-*
