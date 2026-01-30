@@ -74,12 +74,15 @@ jobs:
         run: |
           sudo apt-get install -y file
           make appimage
-          VARIANT_SUFFIX=""
           if [ "${{ matrix.variant }}" = "atomic" ]; then
-            VARIANT_SUFFIX="-atomic"
+            # Atomic builds: only keep AppImage with -atomic suffix
+            mv build/bin/Aerion-*.AppImage build/bin/Aerion-linux-${{ matrix.arch }}-atomic.AppImage
+            rm -f build/bin/aerion
+          else
+            # Regular builds: keep both binary and AppImage
+            mv build/bin/aerion build/bin/aerion-linux-${{ matrix.arch }}
+            mv build/bin/Aerion-*.AppImage build/bin/Aerion-linux-${{ matrix.arch }}.AppImage
           fi
-          mv build/bin/aerion build/bin/aerion-linux-${{ matrix.arch }}${VARIANT_SUFFIX}
-          mv build/bin/Aerion-*.AppImage build/bin/Aerion-linux-${{ matrix.arch }}${VARIANT_SUFFIX}.AppImage
 
       - name: Build (macOS)
         if: matrix.platform == 'darwin'
