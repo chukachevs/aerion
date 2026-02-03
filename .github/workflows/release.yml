@@ -111,6 +111,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble-20260113
+      options: --privileged
     env:
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
@@ -163,7 +164,7 @@ jobs:
 
       - name: Package into Flatpak
         run: |
-          flatpak-builder --force-clean --disable-rofiles-fuse --repo=repo build-dir build/flatpak/com.github.hkdb.Aerion-prebuilt.yml
+          flatpak-builder --force-clean --repo=repo build-dir build/flatpak/com.github.hkdb.Aerion-prebuilt.yml
           mkdir -p build/bin
           flatpak build-bundle repo build/bin/Aerion-${{ github.ref_name }}.flatpak com.github.hkdb.Aerion
 
