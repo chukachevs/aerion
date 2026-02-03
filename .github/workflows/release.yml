@@ -117,7 +117,7 @@ jobs:
       MICROSOFT_CLIENT_ID: ${{ secrets.MICROSOFT_CLIENT_ID }}
       DEBIAN_FRONTEND: noninteractive
       CGO_ENABLED: 1
-      PATH: /usr/local/go/bin:/root/go/bin:/usr/local/node-v20.11.0-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PATH: /usr/local/go/bin:/github/home/go/bin:/usr/local/node-v20.11.0-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
