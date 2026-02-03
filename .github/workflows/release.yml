@@ -116,6 +116,7 @@ jobs:
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       MICROSOFT_CLIENT_ID: ${{ secrets.MICROSOFT_CLIENT_ID }}
       DEBIAN_FRONTEND: noninteractive
+      CGO_ENABLED: 1
       PATH: /usr/local/go/bin:/root/go/bin:/usr/local/node-v20.11.0-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
       - name: Checkout code
@@ -127,7 +128,7 @@ jobs:
           apt-get install -y \
             flatpak flatpak-builder git \
             libgtk-3-dev libwebkit2gtk-4.1-dev \
-            build-essential wget
+            build-essential wget pkg-config
 
       - name: Set up Go
         run: |
@@ -140,8 +141,15 @@ jobs:
 
       - name: Install Wails CLI
         run: |
-          go install github.com/wailsapp/wails/v2/cmd/wails@latest
-          which wails
+          set -x
+          echo "Installing Wails CLI..."
+          go version
+          which go
+          echo "Running go install..."
+          go install -v github.com/wailsapp/wails/v2/cmd/wails@latest 2>&1 || { echo "go install failed with exit code $?"; exit 1; }
+          echo "Verifying installation..."
+          ls -la /root/go/bin/
+          which wails || { echo "wails not found in PATH"; exit 1; }
           wails version
 
       - name: Install frontend dependencies
