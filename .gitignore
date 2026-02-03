@@ -9,6 +9,11 @@ build/linux/AppDir
 .claude
 .crush
 
+# Flatpak build artifacts
+.flatpak-builder/
+build-dir/
+repo/
+
 # Frontend
 frontend/node_modules/
 frontend/dist/
