@@ -145,10 +145,20 @@ jobs:
           echo "Installing Wails CLI..."
           go version
           which go
+          echo "GOPATH is: $(go env GOPATH)"
+          echo "HOME is: $HOME"
           echo "Running go install..."
-          go install -v github.com/wailsapp/wails/v2/cmd/wails@latest 2>&1 || { echo "go install failed with exit code $?"; exit 1; }
+          go install -v github.com/wailsapp/wails/v2/cmd/wails@latest 2>&1
+          EXIT_CODE=$?
+          echo "go install exit code: $EXIT_CODE"
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "go install failed!"
+            exit 1
+          fi
           echo "Verifying installation..."
-          ls -la /root/go/bin/
+          echo "Contents of GOPATH:"
+          ls -la "$(go env GOPATH)" || echo "GOPATH directory doesn't exist"
+          ls -la "$(go env GOPATH)/bin/" || echo "GOPATH/bin directory doesn't exist"
           which wails || { echo "wails not found in PATH"; exit 1; }
           wails version
 
