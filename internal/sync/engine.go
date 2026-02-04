@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"mime/quotedprintable"
 	"regexp"
 	"sort"
 	"strings"
@@ -2379,6 +2380,10 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 				Int("partBodyLen", len(partBody)).
 				Msg("Read part body successfully")
 
+			// First, check if content needs explicit quoted-printable decoding
+			// (go-message should handle this via Entity.Body, but some edge cases might slip through)
+			partBody = decodeQuotedPrintableIfNeeded(partBody)
+
 			// Decode charset to UTF-8
 			charset := params["charset"]
 
@@ -2390,6 +2395,18 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 					Msg("Extracted charset from HTML meta tags")
 			}
 			decodedContent := decodeCharset(partBody, charset)
+
+			// Debug: Check if content still contains quoted-printable sequences
+			if contentType == "text/html" && len(decodedContent) > 200 {
+				snippet := decodedContent
+				if len(snippet) > 200 {
+					snippet = snippet[:200]
+				}
+				e.log.Debug().
+					Str("htmlSnippet", snippet).
+					Bool("hasQuotedPrintable", strings.Contains(decodedContent, "=3D")).
+					Msg("HTML content analysis")
+			}
 
 			switch contentType {
 			case "text/plain":
@@ -2434,6 +2451,9 @@ func (e *Engine) parseMessageBody(raw []byte) (bodyText, bodyHTML string, hasAtt
 		}
 
 		e.log.Debug().Int("bodyLen", len(body)).Msg("Read single-part message body")
+
+		// First, check if content needs explicit quoted-printable decoding
+		body = decodeQuotedPrintableIfNeeded(body)
 
 		// Decode charset to UTF-8
 		charset := params["charset"]
@@ -3135,6 +3155,35 @@ func (e *Engine) FetchRawMessage(ctx context.Context, accountID, folderID string
 	}
 
 	return rawBytes, nil
+}
+
+// decodeQuotedPrintableIfNeeded detects and decodes quoted-printable content if it wasn't already decoded.
+// This is a safety measure for cases where go-message might not automatically decode it.
+func decodeQuotedPrintableIfNeeded(content []byte) []byte {
+	// Quick check: if content doesn't contain "=3D" or "=\n" patterns, it's likely not QP-encoded
+	contentStr := string(content)
+	if !strings.Contains(contentStr, "=3D") && !strings.Contains(contentStr, "=\n") && !strings.Contains(contentStr, "=\r\n") {
+		return content
+	}
+
+	log := logging.WithComponent("quoted-printable")
+	log.Debug().Msg("Detected potential quoted-printable encoding, attempting decode")
+
+	// Try to decode as quoted-printable
+	reader := quotedprintable.NewReader(bytes.NewReader(content))
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		log.Debug().Err(err).Msg("Quoted-printable decode failed, returning original content")
+		return content
+	}
+
+	log.Debug().
+		Int("originalLen", len(content)).
+		Int("decodedLen", len(decoded)).
+		Bool("stillHasQP", strings.Contains(string(decoded), "=3D")).
+		Msg("Quoted-printable decode successful")
+
+	return decoded
 }
 
 // decodeCharset converts content from the specified charset to UTF-8

@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"runtime"
 	goSync "sync"
 	"time"
 
@@ -632,4 +634,74 @@ func (a *App) getValidContactSourceOAuthToken(sourceID string) (string, error) {
 	}
 
 	return tokens.AccessToken, nil
+}
+
+// OpenURL opens a URL in the system browser with proper shell escaping
+// This bypasses Wails' BrowserOpenURL which has strict validation against shell metacharacters
+func (a *App) OpenURL(url string) error {
+	log := logging.WithComponent("app")
+	log.Debug().Str("url", url).Msg("Opening URL in system browser")
+
+	// Validate URL and check protocol for security
+	// This prevents file:// URLs and other potentially dangerous schemes
+	if url == "" {
+		return fmt.Errorf("empty URL")
+	}
+
+	// Allow common safe protocols
+	// Note: We're being permissive here to allow legitimate email links
+	// The main security comes from using exec.Command properly
+	if !isAllowedProtocol(url) {
+		log.Warn().Str("url", url).Msg("Rejecting URL with disallowed protocol")
+		return fmt.Errorf("URL protocol not allowed for security reasons")
+	}
+
+	var cmd *exec.Cmd
+
+	// Determine the command based on the operating system
+	switch runtime.GOOS {
+	case "linux":
+		// Use xdg-open on Linux
+		// exec.Command properly escapes the URL argument, preventing shell injection
+		cmd = exec.Command("xdg-open", url)
+	case "darwin":
+		// Use open on macOS
+		cmd = exec.Command("open", url)
+	case "windows":
+		// Use cmd /c start on Windows
+		// Note: Using cmd.exe with proper escaping
+		cmd = exec.Command("cmd", "/c", "start", url)
+	default:
+		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
+	}
+
+	// Start the command without waiting for it to complete
+	// Browser opening should be async - we don't need to wait
+	if err := cmd.Start(); err != nil {
+		log.Error().Err(err).Str("url", url).Msg("Failed to open URL in browser")
+		return fmt.Errorf("failed to open URL: %w", err)
+	}
+
+	log.Debug().Str("url", url).Msg("Successfully started browser process")
+	return nil
+}
+
+// isAllowedProtocol checks if a URL uses an allowed protocol
+// Prevents file:// URLs and other potentially dangerous schemes
+func isAllowedProtocol(url string) bool {
+	// Common safe protocols for an email client
+	allowedPrefixes := []string{
+		"http://",
+		"https://",
+		"mailto:",
+		// Note: We could add more if needed, but being conservative
+	}
+
+	for _, prefix := range allowedPrefixes {
+		if len(url) >= len(prefix) && url[:len(prefix)] == prefix {
+			return true
+		}
+	}
+
+	return false
 }

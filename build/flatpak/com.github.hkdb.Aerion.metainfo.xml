@@ -63,6 +63,15 @@
   </provides>
 
   <releases>
+    <release version="0.1.13" date="2026-02-04">
+      <description>
+        <ul>
+          <li>Fixed links that don't open in browser (ie. Linkedin, etc)</li>
+          <li>Added show link on hover</li>
+          <li>Added context menu for links so users can choose to copy the link instead of clicking it directly</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.12" date="2026-02-03">
       <description>
         <ul>

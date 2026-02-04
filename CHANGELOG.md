@@ -1,5 +1,13 @@
 # CHANGELOG
 
+**v0.1.13 - 02-04-2026**
+---
+
+- Fixed links that don't open in browser (ie. Linkedin, etc)
+- Added show link on hover
+- Added context menu for links so users can choose to copy the link instead of clicking it directly
+
+
 **v0.1.12 - 02-03-2026**
 ---
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import Icon from '@iconify/svelte'
   import { BrowserOpenURL } from '../../../../wailsjs/runtime/runtime'
-  import { GetInlineAttachments, IsImageAllowed, AddImageAllowlist } from '../../../../wailsjs/go/app/App'
+  import { GetInlineAttachments, IsImageAllowed, AddImageAllowlist, OpenURL } from '../../../../wailsjs/go/app/App'
   import { getCached, setCache } from '../../stores/inlineAttachmentCache'
   import { setFocusedPane, focusPreviousPane, focusNextPane } from '$lib/stores/keyboard.svelte'
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
@@ -21,10 +21,22 @@
   let imagesBlocked = $state(true)
   let iframeElement = $state<HTMLIFrameElement | null>(null)
   let iframeReady = $state(false)
-  
+
   // Inline attachment state
   let inlineAttachments = $state<Record<string, string>>({})
   let lastSentMessageId = $state<string | null>(null)
+
+  // Link tooltip state
+  let tooltipVisible = $state(false)
+  let tooltipUrl = $state('')
+  let tooltipX = $state(0)
+  let tooltipY = $state(0)
+
+  // Link context menu state
+  let linkContextMenuVisible = $state(false)
+  let linkContextMenuUrl = $state('')
+  let linkContextMenuX = $state(0)
+  let linkContextMenuY = $state(0)
   
   // Derived state
   let hasRemoteImages = $derived(checkForRemoteImages(bodyHtml))
@@ -122,6 +134,42 @@
         }
       });
 
+      // Handle link hover for tooltip
+      document.addEventListener('mouseover', function(e) {
+        var link = e.target.closest('a');
+        if (link && link.href) {
+          var rect = link.getBoundingClientRect();
+          window.parent.postMessage({
+            type: 'link-hover',
+            url: link.href,
+            x: rect.left,
+            y: rect.bottom
+          }, '*');
+        }
+      });
+
+      document.addEventListener('mouseout', function(e) {
+        var link = e.target.closest('a');
+        if (link && link.href) {
+          window.parent.postMessage({ type: 'link-hover-end' }, '*');
+        }
+      });
+
+      // Handle right-click context menu for links
+      document.addEventListener('contextmenu', function(e) {
+        var link = e.target.closest('a');
+        if (link && link.href) {
+          e.preventDefault();
+          var rect = link.getBoundingClientRect();
+          window.parent.postMessage({
+            type: 'link-contextmenu',
+            url: link.href,
+            x: e.clientX,
+            y: e.clientY
+          }, '*');
+        }
+      });
+
       // Forward keyboard events to parent for global shortcuts (only modifier keys and Escape)
       document.addEventListener('keydown', function(e) {
         // Only forward events that need global handling
@@ -201,6 +249,32 @@ ${processedHtml}
 </html>`
   }
 
+  // Helper function to safely open URLs
+  // Uses our custom OpenURL backend function which properly handles shell escaping
+  async function safeOpenURL(url: string) {
+    console.log('[EmailBody] Opening URL:', url)
+
+    // Validate URL format first
+    try {
+      new URL(url) // Validate it's a proper URL
+
+      // Use our backend OpenURL function which properly handles shell escaping
+      try {
+        await OpenURL(url)
+      } catch (err) {
+        console.error('[EmailBody] OpenURL failed:', err)
+        // Fallback to direct BrowserOpenURL
+        try {
+          BrowserOpenURL(url)
+        } catch (err2) {
+          console.error('[EmailBody] BrowserOpenURL also failed:', err2)
+        }
+      }
+    } catch (e) {
+      console.error('[EmailBody] Invalid URL:', url, e)
+    }
+  }
+
   function handleIframeMessage(event: MessageEvent) {
     if (event.data?.type === 'iframe-height' && iframeElement) {
       iframeElement.style.height = `${event.data.height + 20}px`
@@ -208,6 +282,7 @@ ${processedHtml}
       iframeReady = true
     } else if (event.data?.type === 'open-link') {
       const url = event.data.url as string
+
       if (url.startsWith('mailto:')) {
         // Handle mailto: links by opening composer
         const emailAddress = url.replace('mailto:', '').split('?')[0]
@@ -215,11 +290,11 @@ ${processedHtml}
           onCompose(emailAddress)
         } else {
           // Fallback to system handler if no compose callback
-          BrowserOpenURL(url)
+          safeOpenURL(url)
         }
       } else {
         // Open external links in system browser
-        BrowserOpenURL(url)
+        safeOpenURL(url)
       }
     } else if (event.data?.type === 'iframe-keydown') {
       // Handle Alt+arrow/hjkl directly for pane navigation
@@ -251,6 +326,27 @@ ${processedHtml}
     } else if (event.data?.type === 'iframe-focus') {
       // Set focus to viewer pane when iframe is clicked/focused
       setFocusedPane('viewer')
+    } else if (event.data?.type === 'link-hover') {
+      // Show tooltip with link URL - adjust coordinates relative to iframe position
+      if (iframeElement) {
+        const iframeRect = iframeElement.getBoundingClientRect()
+        tooltipUrl = event.data.url
+        tooltipX = iframeRect.left + event.data.x
+        tooltipY = iframeRect.top + event.data.y
+        tooltipVisible = true
+      }
+    } else if (event.data?.type === 'link-hover-end') {
+      // Hide tooltip
+      tooltipVisible = false
+    } else if (event.data?.type === 'link-contextmenu') {
+      // Show context menu for link - adjust coordinates relative to iframe position
+      if (iframeElement) {
+        const iframeRect = iframeElement.getBoundingClientRect()
+        linkContextMenuUrl = event.data.url
+        linkContextMenuX = iframeRect.left + event.data.x
+        linkContextMenuY = iframeRect.top + event.data.y
+        linkContextMenuVisible = true
+      }
     }
   }
 
@@ -421,9 +517,21 @@ ${processedHtml}
     escaped = escaped.replace(emailPattern, '<a href="mailto:$1" class="text-primary hover:underline">$1</a>')
     return escaped
   }
+
+  // Copy link to clipboard
+  async function copyLinkToClipboard() {
+    if (linkContextMenuUrl) {
+      try {
+        await navigator.clipboard.writeText(linkContextMenuUrl)
+        linkContextMenuVisible = false
+      } catch (err) {
+        console.error('[EmailBody] Failed to copy link:', err)
+      }
+    }
+  }
 </script>
 
-<div class="email-body">
+<div class="email-body relative">
   {#if bodyHtml}
     {#if hasRemoteImages && imagesBlocked}
       <div class="flex items-center gap-2 px-3 py-2 mb-3 rounded-md bg-yellow-500/10 border border-yellow-500/30 text-sm">
@@ -463,7 +571,7 @@ ${processedHtml}
         </div>
       </div>
     {/if}
-    
+
     <iframe
       bind:this={iframeElement}
       title="Email content"
@@ -478,4 +586,46 @@ ${processedHtml}
   {:else}
     <p class="text-muted-foreground italic">No content available</p>
   {/if}
+
+  <!-- Link hover tooltip -->
+  {#if tooltipVisible && tooltipUrl}
+    <div
+      class="fixed z-50 px-3 py-1.5 text-xs bg-gray-800 dark:bg-gray-200 text-white dark:text-gray-900 rounded shadow-lg max-w-md truncate pointer-events-none border border-gray-700 dark:border-gray-300"
+      style="left: {tooltipX}px; top: {tooltipY + 5}px;"
+    >
+      {tooltipUrl}
+    </div>
+  {/if}
+
+  <!-- Link context menu -->
+  {#if linkContextMenuVisible}
+    <div
+      class="fixed z-50 bg-white dark:bg-gray-800 rounded-md shadow-lg border border-gray-200 dark:border-gray-700 py-1 min-w-[160px]"
+      style="left: {linkContextMenuX}px; top: {linkContextMenuY}px;"
+      role="menu"
+    >
+      <button
+        class="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+        onclick={copyLinkToClipboard}
+      >
+        <Icon icon="mdi:content-copy" class="w-4 h-4" />
+        Copy Link
+      </button>
+      <button
+        class="w-full px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"
+        onclick={() => linkContextMenuVisible = false}
+      >
+        <Icon icon="mdi:close" class="w-4 h-4" />
+        Cancel
+      </button>
+    </div>
+  {/if}
 </div>
+
+<!-- Click outside to close context menu -->
+{#if linkContextMenuVisible}
+  <div
+    class="fixed inset-0 z-40"
+    onclick={() => linkContextMenuVisible = false}
+  ></div>
+{/if}
