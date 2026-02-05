@@ -17,114 +17,40 @@ Before submitting to Flathub:
 
 ## Updating the Manifest for New Releases
 
-### Step 1: Calculate Hashes
-
-Use the provided script to get SHA256 hashes and file sizes:
+Use the provided script to calculate SHA256 hashes and automatically update the manifest:
 
 ```bash
 ./calculate-hashes.sh v0.1.14
 ```
 
-This will output all the values you need for the manifest.
+This will:
+- Download the release tarballs from GitHub
+- Calculate SHA256 hashes and file sizes
+- Automatically update `com.github.hkdb.Aerion-extradata.yml` with new values
+- Create a backup of the original file
 
-### Step 2: Update the Manifest
+## Initial Flathub Submission (v0.1.14 - Ready Now!)
 
-Edit `com.github.hkdb.Aerion-extradata.yml` and update:
+### Step 1: Fork flathub/flathub
 
-1. **Version in URLs**: Change `v0.1.13` to `v0.1.14` in all URL fields
-2. **SHA256 hashes**: Replace with values from calculate-hashes.sh output
-3. **File sizes**: Replace with values from calculate-hashes.sh output
+**Go to**: https://github.com/flathub/flathub/fork
 
-The script output will look like:
-```
-x86_64 tarball:
-  url: https://github.com/hkdb/aerion/releases/download/v0.1.14/aerion-v0.1.14-linux-x86_64.tar.gz
-  sha256: abc123...
-  size: 12345678
-```
+**CRITICAL**: **Uncheck** "Copy the master branch only" - you need the `new-pr` branch!
 
-### Step 3: Test Locally
+### Step 2: Clone and Create Submission Branch
 
 ```bash
-# Install runtimes if not already installed
-flatpak install flathub org.gnome.Platform//47
-flatpak install flathub org.gnome.Sdk//47
+# Clone your fork starting from new-pr branch
+git clone --branch=new-pr git@github.com:YOUR_USERNAME/flathub.git
+cd flathub
 
-# Test build with extradata manifest
-flatpak-builder --force-clean --install-deps-from=flathub \
-    test-build-dir com.github.hkdb.Aerion-extradata.yml
-
-# Test run
-flatpak-builder --run test-build-dir \
-    com.github.hkdb.Aerion-extradata.yml aerion
+# Create your submission branch
+git checkout -b add-aerion new-pr
 ```
 
-**Note**: The build will download your pre-built binaries from GitHub releases.
-
-## Initial Flathub Submission
-
-### Step 1: Create Flathub Issue
-
-Go to https://github.com/flathub/flathub/issues/new and create a new issue:
-
-**Title**: `New app: Aerion`
-
-**Body**:
-```markdown
-# New Application Submission: Aerion
-
-**Name**: Aerion
-**Summary**: Lightweight open-source email client for Linux
-**App ID**: com.github.hkdb.Aerion
-**Homepage**: https://aerion.3df.io
-**Source Repository**: https://github.com/hkdb/aerion
-
-## Description
-Aerion is a modern, lightweight email client built with Wails + Svelte,
-focused on resource efficiency and modern UX. Supports Gmail, Outlook,
-and generic IMAP/SMTP with OAuth2 authentication.
-
-## Key Features
-- Multiple accounts with unified inbox
-- OAuth2 for Gmail and Microsoft
-- Conversation threading
-- CardDAV contact sync
-- Keyboard-friendly navigation
-- Dark mode and themes
-
-## Technical Details
-- **Distribution Method**: Pre-built binaries (extra-data) - similar to Discord, Spotify
-- **Why pre-built**: OAuth credentials are embedded in binaries at build time
-- **Architectures**: x86_64 and aarch64
-- **License**: Apache-2.0
-- **Runtime**: org.gnome.Platform//47
-
-## Maintainer
-GitHub: @hkdb
-
-## Request
-Please create repository: `flathub/com.github.hkdb.Aerion`
-I'm ready to populate it with manifest files.
-```
-
-### Step 2: Wait for Repository Creation
-
-The Flathub team will:
-1. Review your request
-2. Create `https://github.com/flathub/com.github.hkdb.Aerion`
-3. Grant you write access
-
-This usually takes 2-5 days.
-
-### Step 3: Populate Flathub Repository
-
-Once you have access:
+### Step 3: Copy Required Files (5 files total)
 
 ```bash
-# Clone the Flathub repository
-git clone git@github.com:flathub/com.github.hkdb.Aerion.git
-cd com.github.hkdb.Aerion
-
 # Copy manifest (rename to standard name)
 cp /path/to/aerion/build/flatpak/flathub/com.github.hkdb.Aerion-extradata.yml \
    com.github.hkdb.Aerion.yml
@@ -132,68 +58,82 @@ cp /path/to/aerion/build/flatpak/flathub/com.github.hkdb.Aerion-extradata.yml \
 # Copy metainfo
 cp /path/to/aerion/build/flatpak/com.github.hkdb.Aerion.metainfo.xml .
 
+# Copy desktop file (rename to use app ID)
+cp /path/to/aerion/build/linux/aerion.desktop \
+   com.github.hkdb.Aerion.desktop
+
+# Copy icon (rename to use app ID)
+cp /path/to/aerion/build/appicon.png \
+   com.github.hkdb.Aerion.png
+
 # Create flathub.json
 cat > flathub.json << 'EOF'
 {
   "only-arches": ["x86_64", "aarch64"]
 }
 EOF
-
-# Commit and push
-git add .
-git commit -m "Initial Flathub submission for Aerion"
-git push origin master
 ```
 
-### Step 4: Monitor Build
+### Step 4: Commit and Push
 
-After pushing:
-- Flathub CI will automatically build
-- Monitor at: https://buildbot.flathub.org
-- Check repository's Actions/Checks tab
+```bash
+git add .
+git commit -m "Add com.github.hkdb.Aerion"
+git push origin add-aerion
+```
 
-### Step 5: Review Process
+### Step 5: Create Pull Request
 
-Flathub reviewers will check:
-- Manifest correctness
-- Metadata completeness
-- Build success
-- Permissions
+On GitHub, create a pull request:
+- **Base repository**: `flathub/flathub`
+- **Base branch**: `new-pr` ← **CRITICAL!**
+- **Head repository**: `YOUR_USERNAME/flathub`
+- **Compare branch**: `add-aerion`
+- **Title**: `Add com.github.hkdb.Aerion`
+
+### Step 6: Review Process
+
+Flathub reviewers will:
+- Review manifest correctness
+- Check metadata completeness
+- Request changes if needed
 
 **Common feedback**:
 - May ask to restrict `--filesystem=home` to more specific paths
 - Verify extra-data checksums match
 
-## Updating on Flathub
+Comment `bot, build` to trigger a test build once reviewers are satisfied.
 
-For subsequent releases (v0.1.14, v0.1.15, etc.):
+### Step 7: Approval & Repository Creation
+
+After approval:
+- Flathub creates `flathub/com.github.hkdb.Aerion` repository
+- You receive write access invitation (accept within 1 week)
+- Must have 2FA enabled on GitHub
+
+## Updating on Flathub (For Future Releases)
+
+After v0.1.14 is on Flathub, for subsequent releases (v0.1.15, v0.1.16, etc.):
 
 ```bash
 # 1. Create GitHub release with new binaries (GitHub Actions does this)
 
-# 2. Calculate new hashes
+# 2. Calculate hashes and update manifest
 cd /path/to/aerion/build/flatpak/flathub
-./calculate-hashes.sh v0.1.14
+./calculate-hashes.sh v0.1.15
 
-# 3. Update extradata manifest with new values
-# Edit com.github.hkdb.Aerion-extradata.yml
-
-# 4. Update metainfo with new release entry
-# Edit ../com.github.hkdb.Aerion.metainfo.xml
-
-# 5. Commit changes to `hkdb/aerion` repo
+# 3. Commit changes to Aerion repository
 git add .
-git commit -m "<version> - Flathub submission"
+git commit -m "v0.1.15 - Flathub submission"
 git push
 
-# 6. Push to Flathub repository
-cd /path/to/flathub/com.github.hkdb.Aerion
-cp /path/to/aerion/repo/build/flatpak/flathub/com.github.hkdb.Aerion-extradata.yml \
-   com.github.hkdb.Aerion.yml
-cp /path/to/aerion/repo/build/flatpak/com.github.hkdb.Aerion.metainfo.xml .
+# 4. Release to Flathub repository (using release.sh helper script)
+./release.sh /path/to/flathub/com.github.hkdb.Aerion
+# Script automatically copies: manifest, metainfo, desktop, icon, and flathub.json
 
+cd /path/to/flathub/com.github.hkdb.Aerion
 git add .
-git commit -m "Update to v0.1.14"
+git commit -m "Update to v0.1.15"
 git push
 
 # Flathub auto-builds and publishes (no re-review needed!)
@@ -201,10 +141,16 @@ git push
 
 ## Files in This Directory
 
-- `com.github.hkdb.Aerion-extradata.yml` - Flatpak manifest using pre-built binaries
-- `com.github.hkdb.Aerion.yml` - Alternative manifest (builds from source, not used)
-- `calculate-hashes.sh` - Helper script to calculate SHA256 and sizes for new releases
+- `com.github.hkdb.Aerion-extradata.yml` - Flatpak manifest using pre-built binaries (copy to Flathub as `com.github.hkdb.Aerion.yml`)
+- `com.github.hkdb.Aerion.yml` - Alternative manifest (builds from source, not used for Flathub)
+- `calculate-hashes.sh` - Helper script that automatically updates the manifest with new release hashes
+- `release.sh` - Helper script that copies all files to the Flathub repository
 - `README.md` - This file
+
+**Files to copy from parent directory for Flathub submission:**
+- `../com.github.hkdb.Aerion.metainfo.xml` - AppStream metadata
+- `../../linux/aerion.desktop` - Desktop file (rename to `com.github.hkdb.Aerion.desktop`)
+- `../../appicon.png` - Application icon (rename to `com.github.hkdb.Aerion.png`)
 
 ## OAuth Credentials
 

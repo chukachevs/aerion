@@ -36,15 +36,15 @@ modules:
       - tar xzf aerion.tar.gz
       - install -Dm755 aerion /app/bin/aerion
 
-      # Install desktop file
-      - install -Dm644 aerion.desktop /app/share/applications/com.github.hkdb.Aerion.desktop
+      # Install desktop file (from Flathub repo)
+      - install -Dm644 com.github.hkdb.Aerion.desktop /app/share/applications/com.github.hkdb.Aerion.desktop
       - desktop-file-edit --set-key=Icon --set-value=com.github.hkdb.Aerion /app/share/applications/com.github.hkdb.Aerion.desktop
       - desktop-file-edit --set-key=Exec --set-value=aerion /app/share/applications/com.github.hkdb.Aerion.desktop
 
-      # Install icon
-      - install -Dm644 appicon.png /app/share/icons/hicolor/256x256/apps/com.github.hkdb.Aerion.png
+      # Install icon (from Flathub repo)
+      - install -Dm644 com.github.hkdb.Aerion.png /app/share/icons/hicolor/256x256/apps/com.github.hkdb.Aerion.png
 
-      # Install metainfo
+      # Install metainfo (from Flathub repo)
       - install -Dm644 com.github.hkdb.Aerion.metainfo.xml /app/share/metainfo/com.github.hkdb.Aerion.metainfo.xml
 
     sources:
@@ -66,23 +66,3 @@ modules:
         url: https://github.com/hkdb/aerion/releases/download/v0.1.14/aerion-v0.1.14-linux-aarch64.tar.gz
         sha256: 86b08e5dac17481af153fc38e45a653faf29656e7cd0eae4d96a89a9850e1c4a
         size: 12783074
-
-      # Desktop file from repo
-      - type: file
-        url: https://raw.githubusercontent.com/hkdb/aerion/v0.1.14/build/linux/aerion.desktop
-        sha256: 7b12d8d5caecf743ad18584bf959b8c998e3365cfc0e205e51cfe88961333ce2
-
-      # Icon from repo
-      - type: file
-        url: https://raw.githubusercontent.com/hkdb/aerion/v0.1.14/build/appicon.png
-        sha256: 793b5caa6cbd90d36f39a0b98cdd2f1a405ca7c6306c59abff893f08a49a8bb5
-
-      # Metainfo from repo
-      - type: file
-        url: https://raw.githubusercontent.com/hkdb/aerion/v0.1.14/build/flatpak/com.github.hkdb.Aerion.metainfo.xml
-        sha256: e4d7181c0ffdbbd031a6782272bba00be312e61008688dc948f244032d636ce0
-
-# NOTE: To update for new releases:
-# 1. Run: ./calculate-hashes.sh v0.1.14 (or your version)
-# 2. Copy the output values into this manifest
-# 3. Test build locally before submitting to Flathub
