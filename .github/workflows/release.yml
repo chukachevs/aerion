@@ -156,6 +156,8 @@ jobs:
   build-flatpak:
     needs: publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -207,6 +209,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
           git add build/flatpak/flathub/io.github.hkdb.Aerion.yml
           git commit -m "${{ github.ref_name }} - Flathub submission"
           git push
