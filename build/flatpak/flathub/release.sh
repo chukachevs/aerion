@@ -1,12 +1,12 @@
 #!/bin/bash
 # Copy Aerion files to Flathub repository for submission/update
-# Usage: ./release.sh /path/to/flathub/com.github.hkdb.Aerion
+# Usage: ./release.sh /path/to/flathub/io.github.hkdb.Aerion
 
 set -e
 
 if [ -z "$1" ]; then
     echo "Usage: $0 <flathub-repo-path>"
-    echo "Example: $0 ~/flathub/com.github.hkdb.Aerion"
+    echo "Example: $0 ~/flathub/io.github.hkdb.Aerion"
     exit 1
 fi
 
@@ -30,30 +30,15 @@ echo "Target: $FLATHUB_DIR"
 echo ""
 echo "Copying files..."
 echo ""
+echo "NOTE: Desktop file, icon, and metainfo are downloaded from GitHub releases"
+echo "      Only the manifest and flathub.json are stored in the Flathub repo"
+echo ""
 
 # Copy manifest (rename to standard name)
 echo "📄 Copying manifest..."
-cp "${SCRIPT_DIR}/com.github.hkdb.Aerion-extradata.yml" \
-   "${FLATHUB_DIR}/com.github.hkdb.Aerion.yml"
-echo "   ✅ com.github.hkdb.Aerion.yml"
-
-# Copy metainfo
-echo "📄 Copying metainfo..."
-cp "${BUILD_DIR}/com.github.hkdb.Aerion.metainfo.xml" \
-   "${FLATHUB_DIR}/com.github.hkdb.Aerion.metainfo.xml"
-echo "   ✅ com.github.hkdb.Aerion.metainfo.xml"
-
-# Copy desktop file (rename to use app ID)
-echo "📄 Copying desktop file..."
-cp "${LINUX_DIR}/aerion.desktop" \
-   "${FLATHUB_DIR}/com.github.hkdb.Aerion.desktop"
-echo "   ✅ com.github.hkdb.Aerion.desktop"
-
-# Copy icon (rename to use app ID)
-echo "📄 Copying icon..."
-cp "${BUILD_DIR}/../appicon.png" \
-   "${FLATHUB_DIR}/com.github.hkdb.Aerion.png"
-echo "   ✅ com.github.hkdb.Aerion.png"
+cp "${SCRIPT_DIR}/io.github.hkdb.Aerion.yml" \
+   "${FLATHUB_DIR}/io.github.hkdb.Aerion.yml"
+echo "   ✅ io.github.hkdb.Aerion.yml"
 
 # Create flathub.json if it doesn't exist (only needed for initial submission)
 if [ ! -f "${FLATHUB_DIR}/flathub.json" ]; then

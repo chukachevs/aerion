@@ -116,12 +116,16 @@ type App struct {
 
 	// DebugMode function reference (injected from main)
 	debugMode func() bool
+
+	// UseDirectDBus forces direct D-Bus notifications instead of portal (Linux only)
+	useDirectDBus bool
 }
 
 // NewApp creates a new App application struct
-func NewApp(debugModeFn func() bool) *App {
+func NewApp(debugModeFn func() bool, useDirectDBus bool) *App {
 	return &App{
-		debugMode: debugModeFn,
+		debugMode:     debugModeFn,
+		useDirectDBus: useDirectDBus,
 	}
 }
 

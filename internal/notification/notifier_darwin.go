@@ -18,7 +18,8 @@ type darwinNotifier struct {
 	log          zerolog.Logger
 }
 
-func newPlatformNotifier(appName string) Notifier {
+func newPlatformNotifier(appName string, useDirectDBus bool) Notifier {
+	// useDirectDBus is Linux-only, ignored on macOS
 	return &darwinNotifier{
 		appName: appName,
 		log:     logging.WithComponent("notification"),

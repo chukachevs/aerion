@@ -20,7 +20,7 @@ make flatpak
 flatpak --user install build/bin/Aerion.flatpak
 
 # Run
-flatpak run com.github.hkdb.Aerion
+flatpak run io.github.hkdb.Aerion
 ```
 
 See [build/flatpak/README.md](../build/flatpak/README.md) for detailed Flatpak build instructions and Flathub submission guide.

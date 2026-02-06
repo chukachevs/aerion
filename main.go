@@ -28,6 +28,7 @@ var (
 	mode        = flag.String("mode", "new", "Compose mode: new, reply, reply-all, forward")
 	messageID   = flag.String("message-id", "", "Original message ID for reply/forward")
 	draftID     = flag.String("draft-id", "", "Draft ID to resume editing")
+	dbusNotify  = flag.Bool("dbus-notify", false, "Use direct D-Bus notifications instead of portal (Linux only)")
 )
 
 // DebugMode returns whether debug logging is enabled
@@ -128,7 +129,7 @@ func main() {
 // runMainMode runs the main application window
 func runMainMode(mailtoData *app.MailtoData) {
 	// Create an instance of the app structure
-	application := app.NewApp(DebugMode)
+	application := app.NewApp(DebugMode, *dbusNotify)
 
 	// Store mailto data if provided (will be used after startup)
 	if mailtoData != nil {

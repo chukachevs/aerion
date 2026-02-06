@@ -5,13 +5,14 @@ Name=Aerion
 GenericName=Email
 Comment=A modern, cross-platform email client
 Keywords=Mail;E-mail;email;IMAP;SMTP;CardDAV;
-Icon=aerion
+Icon=io.github.hkdb.Aerion
 TryExec=aerion
 Exec=aerion %U
 Terminal=false
 Categories=Network;Email;
 MimeType=x-scheme-handler/mailto;
 StartupNotify=true
+StartupWMClass=Aerion
 X-GNOME-UsesNotifications=true
 Actions=compose;
 

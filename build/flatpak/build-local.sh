@@ -29,9 +29,9 @@ fi
 
 # Check if runtimes are installed
 echo "Checking for required runtimes..."
-if ! flatpak list --runtime | grep -q "org.gnome.Platform.*47"; then
-    echo "⚠️  GNOME Platform 47 not found. Installing..."
-    flatpak install -y --user flathub org.gnome.Platform//47 org.gnome.Sdk//47
+if ! flatpak list --runtime | grep -q "org.gnome.Platform.*49"; then
+    echo "⚠️  GNOME Platform 49 not found. Installing..."
+    flatpak install -y --user flathub org.gnome.Platform//49 org.gnome.Sdk//49
 fi
 
 if ! flatpak list | grep -q "org.freedesktop.Sdk.Extension.golang"; then
@@ -67,7 +67,7 @@ echo "This will take a few minutes..."
 echo ""
 
 flatpak-builder --force-clean --user --install-deps-from=flathub \
-    --repo=repo build-dir build/flatpak/com.github.hkdb.Aerion-prebuilt.yml
+    --repo=repo build-dir build/flatpak/flathub/io.github.hkdb.Aerion.yml
 
 # Create bundle for distribution
 echo ""
@@ -78,7 +78,7 @@ mkdir -p build/bin
 VERSION=$(git describe --tags --exact-match 2>/dev/null || echo "dev")
 BUNDLE_NAME="Aerion-${VERSION}.flatpak"
 
-flatpak build-bundle repo "build/bin/${BUNDLE_NAME}" com.github.hkdb.Aerion
+flatpak build-bundle repo "build/bin/${BUNDLE_NAME}" io.github.hkdb.Aerion
 
 echo ""
 echo "✅ Build complete!"
@@ -89,4 +89,4 @@ echo "To install locally:"
 echo "  flatpak install --user Aerion.flatpak"
 echo ""
 echo "To run:"
-echo "  flatpak run com.github.hkdb.Aerion"
+echo "  flatpak run io.github.hkdb.Aerion"

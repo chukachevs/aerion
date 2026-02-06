@@ -38,6 +38,6 @@ type Notifier interface {
 }
 
 // New creates a platform-specific Notifier
-func New(appName string) Notifier {
-	return newPlatformNotifier(appName)
+func New(appName string, useDirectDBus bool) Notifier {
+	return newPlatformNotifier(appName, useDirectDBus)
 }

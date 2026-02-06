@@ -9,9 +9,9 @@ This directory contains files for building and distributing Aerion as a Flatpak.
 
 ## Files
 
-- `com.github.hkdb.Aerion.yml` - Flatpak manifest for local building (builds from source)
-- `com.github.hkdb.Aerion-prebuilt.yml` - Flatpak manifest using pre-built binary
-- `com.github.hkdb.Aerion.metainfo.xml` - AppStream metadata (required for Flathub)
+- `io.github.hkdb.Aerion-source.yml` - Flatpak manifest for local building (builds from source)
+- `io.github.hkdb.Aerion.yml` - Flatpak manifest using pre-built binaries (in flathub/ subdirectory)
+- `io.github.hkdb.Aerion.metainfo.xml` - AppStream metadata (required for Flathub)
 - `build-flatpak.sh` - Automated build script
 - `flathub/` - Flathub submission files (pre-built binary approach)
 - `README.md` - This file
@@ -54,7 +54,7 @@ Build the Flatpak from the project root:
 ./build/flatpak/build-flatpak.sh
 
 # Or manually from project root
-flatpak-builder --force-clean --user --install build-dir build/flatpak/com.github.hkdb.Aerion.yml
+flatpak-builder --force-clean --user --install build-dir build/flatpak/io.github.hkdb.Aerion-source.yml
 
 # Or via make
 make flatpak
@@ -71,7 +71,7 @@ This will:
 After building, run the Flatpak:
 
 ```bash
-flatpak run com.github.hkdb.Aerion
+flatpak run io.github.hkdb.Aerion
 ```
 
 ## Testing
@@ -80,13 +80,13 @@ Test the app thoroughly:
 
 ```bash
 # Run with terminal output for debugging
-flatpak run com.github.hkdb.Aerion
+flatpak run io.github.hkdb.Aerion
 
 # Check permissions
-flatpak info --show-permissions com.github.hkdb.Aerion
+flatpak info --show-permissions io.github.hkdb.Aerion
 
 # Override permissions for testing (example: restrict to Downloads only)
-flatpak override --user --nofilesystem=home --filesystem=xdg-download com.github.hkdb.Aerion
+flatpak override --user --nofilesystem=home --filesystem=xdg-download io.github.hkdb.Aerion
 ```
 
 ## OAuth Credentials
@@ -138,7 +138,7 @@ sudo dnf install libappstream-glib  # Fedora
 sudo apt install appstream-util      # Ubuntu/Debian
 
 # Validate (from project root)
-appstream-util validate build/flatpak/com.github.hkdb.Aerion.metainfo.xml
+appstream-util validate build/flatpak/io.github.hkdb.Aerion.metainfo.xml
 ```
 
 Validate the desktop file:
@@ -201,7 +201,7 @@ The manifest grants `--filesystem=home` access. For production, consider restric
 
 When testing a new version locally:
 
-1. Update `build/flatpak/com.github.hkdb.Aerion.metainfo.xml` with new release info
+1. Update `build/flatpak/io.github.hkdb.Aerion.metainfo.xml` with new release info
 2. Update OAuth credentials in environment if needed
 3. Build and test locally: `./build/flatpak/build-flatpak.sh`
 

@@ -17,7 +17,8 @@ type windowsNotifier struct {
 	log          zerolog.Logger
 }
 
-func newPlatformNotifier(appName string) Notifier {
+func newPlatformNotifier(appName string, useDirectDBus bool) Notifier {
+	// useDirectDBus is Linux-only, ignored on Windows
 	return &windowsNotifier{
 		appName: appName,
 		log:     logging.WithComponent("notification"),

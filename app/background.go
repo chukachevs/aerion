@@ -335,7 +335,7 @@ func (a *App) sendSystemNotification(info sync.NewMailInfo, subject, fromName, f
 func (a *App) initNotifications(ctx context.Context) {
 	log := logging.WithComponent("app.notify")
 
-	a.notifier = notification.New("Aerion")
+	a.notifier = notification.New("Aerion", a.useDirectDBus)
 
 	// Set click handler to navigate to the message
 	a.notifier.SetClickHandler(func(data notification.NotificationData) {
@@ -345,7 +345,8 @@ func (a *App) initNotifications(ctx context.Context) {
 			Str("threadId", data.ThreadID).
 			Msg("Notification clicked, navigating to message")
 
-		// Bring window to foreground
+		// Bring window to foreground and unminimise if needed
+		wailsRuntime.WindowUnminimise(a.ctx)
 		wailsRuntime.WindowShow(a.ctx)
 
 		// Emit event to frontend to navigate to the message

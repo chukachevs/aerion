@@ -63,12 +63,12 @@ docker run --rm \
 
         echo ''
         echo 'Packaging into Flatpak...'
-        flatpak-builder --force-clean --repo=repo build-dir build/flatpak/com.github.hkdb.Aerion-prebuilt.yml
+        flatpak-builder --force-clean --repo=repo build-dir build/flatpak/flathub/io.github.hkdb.Aerion.yml
 
         echo ''
         echo 'Creating .flatpak bundle...'
         mkdir -p build/bin
-        flatpak build-bundle repo build/bin/Aerion-${VERSION}.flatpak com.github.hkdb.Aerion
+        flatpak build-bundle repo build/bin/Aerion-${VERSION}.flatpak io.github.hkdb.Aerion
     "
 
 echo ""
@@ -80,4 +80,4 @@ echo "To install locally:"
 echo "  flatpak install --user build/bin/Aerion-${VERSION}.flatpak"
 echo ""
 echo "To run:"
-echo "  flatpak run com.github.hkdb.Aerion"
+echo "  flatpak run io.github.hkdb.Aerion"

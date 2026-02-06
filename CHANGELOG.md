@@ -1,5 +1,18 @@
 # CHANGELOG
 
+**v0.1.15 - 02-05-2026**
+---
+
+- Refactored Linux notifications to use org.freedesktop.portal.Desktop
+- Kept DBUS direct notifications if launched with --dbus-notify
+- Added trigger to refocus to Aerion if notification is clicked
+- Added `install.sh` and `uninstall.sh` to Linux binary release
+- Distribute binary tarballs with assets instead of just binary for Linux
+- Fixed flatpak app ID
+- Flathub submission fixes
+- New Github Actions worksflow that makes much more sense
+
+
 **v0.1.14 - 02-05-2026**
 ---
 
