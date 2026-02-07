@@ -4,6 +4,7 @@
 ---
 
 - Removed flatpak perm that's already allowed by default
+- Fixed hash calculation for Flatpak build and Flathub submission
 
 
 **v0.1.15 - 02-05-2026**

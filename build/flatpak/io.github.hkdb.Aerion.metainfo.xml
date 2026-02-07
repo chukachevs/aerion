@@ -67,6 +67,7 @@
       <description>
         <ul>
           <li>Removed flatpak perm that's already allowed by default</li>
+          <li>Fixed hash calculation for Flatpak build and Flathub submission</li>
         </ul>
       </description>
     </release>
