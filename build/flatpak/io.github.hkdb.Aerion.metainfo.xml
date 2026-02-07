@@ -63,6 +63,13 @@
   </provides>
 
   <releases>
+    <release version="0.1.16" date="2026-02-07">
+      <description>
+        <ul>
+          <li>Removed flatpak perm that's already allowed by default</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.15" date="2026-02-06">
       <description>
         <ul>

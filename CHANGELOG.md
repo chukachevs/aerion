@@ -1,5 +1,11 @@
 # CHANGELOG
 
+**v0.1.16 - 02-07-2026**
+---
+
+- Removed flatpak perm that's already allowed by default
+
+
 **v0.1.15 - 02-05-2026**
 ---
 

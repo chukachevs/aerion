@@ -14,8 +14,6 @@ finish-args:
   - --socket=fallback-x11
   # GPU access for hardware acceleration
   - --device=dri
-  # Portal access for notifications, file chooser, secrets, and opening URIs
-  - --talk-name=org.freedesktop.portal.Desktop
   # Sleep/wake detection for sync management
   - --system-talk-name=org.freedesktop.login1
 
