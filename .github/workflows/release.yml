@@ -149,8 +149,6 @@ jobs:
             io.github.hkdb.Aerion.desktop \
             io.github.hkdb.Aerion.png \
             io.github.hkdb.Aerion.metainfo.xml \
-            build/linux/install.sh \
-            build/linux/uninstall.sh \
             --clobber
 
   build-flatpak:
