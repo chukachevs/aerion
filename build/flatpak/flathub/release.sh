@@ -52,18 +52,6 @@ echo "Copying npm package sources..."
 cp "${SCRIPT_DIR}/node-sources.json" "${FLATHUB_DIR}/node-sources.json"
 echo "   node-sources.json"
 
-# Create flathub.json if it doesn't exist (only needed for initial submission)
-if [ ! -f "${FLATHUB_DIR}/flathub.json" ]; then
-    echo "Creating flathub.json..."
-    cat > "${FLATHUB_DIR}/flathub.json" << 'EOF'
-{
-  "only-arches": ["x86_64", "aarch64"]
-}
-EOF
-    echo "   flathub.json (created)"
-else
-    echo "flathub.json already exists (skipped)"
-fi
 
 echo ""
 echo "=========================================="
