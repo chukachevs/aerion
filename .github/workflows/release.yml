@@ -127,6 +127,7 @@ jobs:
           path: |
             build/bin/aerion-*
             build/bin/Aerion-*
+            build/bin/flathub-build-env-*
             aerion-*.tar.gz
           retention-days: 1
 
