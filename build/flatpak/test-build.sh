@@ -59,7 +59,7 @@ echo "Cleaning flatpak-builder cache..."
 rm -rf .flatpak-builder
 
 echo "Checking if shim binary release assets are available..."
-if ! wget -q --spider "https://github.com/hkdb/aerion/releases/download/${VERSION}/aerion-creds-${VERSION}-linux-x86_64"; then
+if ! wget -q --spider "https://github.com/hkdb/aerion/releases/download/${VERSION}/flathub-build-env-${VERSION}-linux-x86_64"; then
     echo ""
     echo "ERROR: Shim binary not found for ${VERSION}"
     echo "   Make sure the release exists at:"

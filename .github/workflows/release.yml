@@ -77,12 +77,12 @@ jobs:
           if [ "${{ matrix.arch }}" = "amd64" ]; then
             CGO_ENABLED=0 GOARCH=amd64 go build \
               -ldflags "-X 'main.GoogleClientID=$GOOGLE_CLIENT_ID' -X 'main.GoogleClientSecret=$GOOGLE_CLIENT_SECRET' -X 'main.MicrosoftClientID=$MICROSOFT_CLIENT_ID'" \
-              -o build/bin/aerion-creds-${{ github.ref_name }}-linux-x86_64 \
+              -o build/bin/flathub-build-env-${{ github.ref_name }}-linux-x86_64 \
               cmd/aerion-creds/main.go
           elif [ "${{ matrix.arch }}" = "arm64" ]; then
             CGO_ENABLED=0 GOARCH=arm64 go build \
               -ldflags "-X 'main.GoogleClientID=$GOOGLE_CLIENT_ID' -X 'main.GoogleClientSecret=$GOOGLE_CLIENT_SECRET' -X 'main.MicrosoftClientID=$MICROSOFT_CLIENT_ID'" \
-              -o build/bin/aerion-creds-${{ github.ref_name }}-linux-aarch64 \
+              -o build/bin/flathub-build-env-${{ github.ref_name }}-linux-aarch64 \
               cmd/aerion-creds/main.go
           fi
 

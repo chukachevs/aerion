@@ -58,7 +58,7 @@ TEMP_DIR=$(mktemp -d)
 cd "$TEMP_DIR"
 
 # x86_64 shim
-CREDS_X86="aerion-creds-${VERSION}-linux-x86_64"
+CREDS_X86="flathub-build-env-${VERSION}-linux-x86_64"
 if wget -q "${REPO}/releases/download/${VERSION}/${CREDS_X86}"; then
     CREDS_X86_SHA256=$(sha256sum "$CREDS_X86" | awk '{print $1}')
     echo "   x86_64 shim: ${CREDS_X86_SHA256}"
@@ -68,7 +68,7 @@ else
 fi
 
 # aarch64 shim
-CREDS_ARM="aerion-creds-${VERSION}-linux-aarch64"
+CREDS_ARM="flathub-build-env-${VERSION}-linux-aarch64"
 if wget -q "${REPO}/releases/download/${VERSION}/${CREDS_ARM}"; then
     CREDS_ARM_SHA256=$(sha256sum "$CREDS_ARM" | awk '{print $1}')
     echo "   aarch64 shim: ${CREDS_ARM_SHA256}"
@@ -87,10 +87,10 @@ rm -rf "$TEMP_DIR"
 echo "Updating manifest..."
 
 # Update x86_64 shim URL
-sed -i "s|url: https://github.com/hkdb/aerion/releases/download/v[0-9.]*[-a-zA-Z0-9]*/aerion-creds-v[0-9.]*[-a-zA-Z0-9]*-linux-x86_64|url: ${REPO}/releases/download/${VERSION}/${CREDS_X86}|" "$MANIFEST"
+sed -i "s|url: https://github.com/hkdb/aerion/releases/download/v[0-9.]*[-a-zA-Z0-9]*/flathub-build-env-v[0-9.]*[-a-zA-Z0-9]*-linux-x86_64|url: ${REPO}/releases/download/${VERSION}/${CREDS_X86}|" "$MANIFEST"
 
 # Update aarch64 shim URL
-sed -i "s|url: https://github.com/hkdb/aerion/releases/download/v[0-9.]*[-a-zA-Z0-9]*/aerion-creds-v[0-9.]*[-a-zA-Z0-9]*-linux-aarch64|url: ${REPO}/releases/download/${VERSION}/${CREDS_ARM}|" "$MANIFEST"
+sed -i "s|url: https://github.com/hkdb/aerion/releases/download/v[0-9.]*[-a-zA-Z0-9]*/flathub-build-env-v[0-9.]*[-a-zA-Z0-9]*-linux-aarch64|url: ${REPO}/releases/download/${VERSION}/${CREDS_ARM}|" "$MANIFEST"
 
 # Update x86_64 shim sha256 (find the sha256 line after the x86_64 URL)
 awk -v sha="$CREDS_X86_SHA256" '
