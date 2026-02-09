@@ -24,7 +24,7 @@
     isInputElement 
   } from '$lib/stores/keyboard.svelte'
   // @ts-ignore - wailsjs path
-  import { PrepareReply, GetPendingMailto, GetDraft, Trash, DeletePermanently, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted } from '../wailsjs/go/app/App.js'
+  import { PrepareReply, GetPendingMailto, GetDraft, Trash, DeletePermanently, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted, GetSystemTheme } from '../wailsjs/go/app/App.js'
   // @ts-ignore - wailsjs path
   import { smtp, folder } from '../wailsjs/go/models'
   // @ts-ignore - wailsjs runtime
@@ -40,6 +40,10 @@
 
   // Theme state - follows stored preference or system
   let theme = $state<ThemeMode>('light')
+
+  // Portal-based system theme (XDG Settings Portal on Linux)
+  let portalThemeAvailable = false
+  let portalTheme: 'light' | 'dark' = 'light'
 
   // React to theme mode changes from settings store
   $effect(() => {
@@ -160,6 +164,18 @@
 
     // Load application settings (including theme mode) and apply theme
     const storedThemeMode = await loadSettings()
+
+    // Try to get system theme from backend (XDG Settings Portal on Linux)
+    try {
+      const sysTheme = await GetSystemTheme()
+      if (sysTheme === 'light' || sysTheme === 'dark') {
+        portalThemeAvailable = true
+        portalTheme = sysTheme
+      }
+    } catch {
+      // Portal not available, will use matchMedia fallback
+    }
+
     applyThemeFromMode(storedThemeMode)
 
     // Check if terms have been accepted
@@ -204,10 +220,22 @@
       }
     }
 
-    // Listen for system theme changes (only applies when mode is 'system')
+    // Listen for system theme changes from backend (XDG Settings Portal)
+    EventsOn('theme:system-preference', (newTheme: string) => {
+      if (newTheme === 'light' || newTheme === 'dark') {
+        portalThemeAvailable = true
+        portalTheme = newTheme
+        if (getThemeMode() === 'system') {
+          theme = portalTheme
+          applyTheme(theme)
+        }
+      }
+    })
+
+    // Listen for system theme changes via matchMedia (fallback when portal unavailable)
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
     mediaQuery.addEventListener('change', (e) => {
-      if (getThemeMode() === 'system') {
+      if (getThemeMode() === 'system' && !portalThemeAvailable) {
         theme = e.matches ? 'dark' : 'light'
         applyTheme(theme)
       }
@@ -243,8 +271,13 @@
   // Apply theme based on mode setting (system/light/dark)
   function applyThemeFromMode(mode: ThemeMode) {
     if (mode === 'system') {
-      const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
-      theme = mediaQuery.matches ? 'dark' : 'light'  // Default purple themes
+      // Use portal-based theme if available, otherwise fall back to matchMedia
+      if (portalThemeAvailable) {
+        theme = portalTheme
+      } else {
+        const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+        theme = mediaQuery.matches ? 'dark' : 'light'
+      }
     } else {
       theme = mode
     }

@@ -22,6 +22,8 @@ export function GetIdentities():Promise<Array<account.Identity>>;
 
 export function GetOriginalMessage():Promise<message.Message>;
 
+export function GetSystemTheme():Promise<string>;
+
 export function GetThemeMode():Promise<string>;
 
 export function PickAttachmentFiles():Promise<Array<app.ComposerAttachment>>;

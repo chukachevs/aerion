@@ -259,7 +259,7 @@ const errorPageHTML = `<!DOCTYPE html>
             justify-content: center;
             align-items: center;
             min-height: 100vh;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            background: linear-gradient(135deg, #1a1a2e 0%%, #16213e 100%%);
             color: #eee;
         }
         .container {
@@ -272,7 +272,7 @@ const errorPageHTML = `<!DOCTYPE html>
             height: 80px;
             margin: 0 auto 1.5rem;
             background: #f87171;
-            border-radius: 50%;
+            border-radius: 50%%;
             display: flex;
             align-items: center;
             justify-content: center;

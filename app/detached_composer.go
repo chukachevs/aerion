@@ -516,6 +516,12 @@ func (c *ComposerApp) GetThemeMode() (string, error) {
 	return c.settingsStore.GetThemeMode()
 }
 
+// GetSystemTheme returns the current system theme preference detected via
+// the XDG Settings Portal on Linux. Returns "light", "dark", or "" if not available.
+func (c *ComposerApp) GetSystemTheme() string {
+	return platform.ReadSystemTheme()
+}
+
 // GetOriginalMessage returns the original message for reply/forward.
 func (c *ComposerApp) GetOriginalMessage() (*message.Message, error) {
 	if c.originalMessage != nil {

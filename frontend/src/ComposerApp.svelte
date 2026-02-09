@@ -10,7 +10,7 @@
   import { createComposerWindowApi } from '$lib/composerApi'
   import { getShowTitleBar, type ThemeMode } from '$lib/stores/settings.svelte'
   // @ts-ignore - wailsjs imports
-  import { GetComposeMode, PrepareReply, GetDraft, CloseWindow, GetThemeMode } from '../wailsjs/go/app/ComposerApp.js'
+  import { GetComposeMode, PrepareReply, GetDraft, CloseWindow, GetThemeMode, GetSystemTheme } from '../wailsjs/go/app/ComposerApp.js'
   // @ts-ignore - wailsjs imports
   import { smtp, app } from '../wailsjs/go/models'
   // @ts-ignore - wailsjs runtime
@@ -48,17 +48,28 @@
     try {
       const savedThemeMode = await GetThemeMode() as ThemeMode
       if (savedThemeMode === 'system') {
-        // If system mode, use OS preference
-        const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
-        theme = mediaQuery.matches ? 'dark' : 'light'
+        // Try portal-based theme first (XDG Settings Portal on Linux)
+        let resolved = false
+        try {
+          const sysTheme = await GetSystemTheme()
+          if (sysTheme === 'light' || sysTheme === 'dark') {
+            theme = sysTheme as ThemeMode
+            resolved = true
+          }
+        } catch {
+          // Portal not available
+        }
+        // Fall back to matchMedia
+        if (!resolved) {
+          const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+          theme = mediaQuery.matches ? 'dark' : 'light'
+        }
       } else {
-        // Use saved theme
         theme = savedThemeMode
       }
       applyTheme(theme)
     } catch (err) {
       console.error('Failed to load theme mode:', err)
-      // Fallback to system preference
       const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
       theme = mediaQuery.matches ? 'dark' : 'light'
       applyTheme(theme)

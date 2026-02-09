@@ -1,5 +1,15 @@
 # CHANGELOG
 
+**v0.1.19 - 02-09-2026**
+---
+
+- Fixed terms acceptance visibility
+- Enhanced system theme detection
+- Fixed idle.go/server.go
+- Implemented a workaround for calling dialog through portal
+- Removed redundant desktop-file-edit commands from Flatpak manifest
+    
+
 **v0.1.18 - 02-08-2026**
 ---
 

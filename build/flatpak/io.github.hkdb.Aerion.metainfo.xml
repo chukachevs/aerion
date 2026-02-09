@@ -63,6 +63,17 @@
   </provides>
 
   <releases>
+    <release version="0.1.19" date="2026-02-09">
+      <description>
+        <ul>
+          <li>Fixed terms acceptance visibility</li>
+          <li>Enhanced system theme detection</li>
+          <li>Fixed idle.go/server.go</li>
+          <li>Implemented a workaround for calling dialog through portal</li>
+          <li>Removed redundant desktop-file-edit commands from Flatpak manifest</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.18" date="2026-02-08">
       <description>
         <ul>

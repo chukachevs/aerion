@@ -161,6 +161,8 @@ export function GetSourceAddressbooks(arg1:string):Promise<Array<carddav.Address
 
 export function GetSpecialFolder(arg1:string,arg2:folder.Type):Promise<folder.Folder>;
 
+export function GetSystemTheme():Promise<string>;
+
 export function GetTermsAccepted():Promise<boolean>;
 
 export function GetThemeMode():Promise<string>;

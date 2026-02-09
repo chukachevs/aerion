@@ -87,7 +87,7 @@ func (ic *IdleConnection) sendEvent(event MailEvent) {
 		// Event sent successfully
 	case <-time.After(ic.config.EventSendTimeout):
 		ic.log.Warn().
-			Str("type", string(event.Type)).
+			Str("type", event.Type.String()).
 			Msg("Event channel full, dropping event (receiver may be stuck)")
 	case <-ic.stopCh:
 		// Connection stopping, discard event

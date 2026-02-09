@@ -30,6 +30,10 @@ export function GetOriginalMessage() {
   return window['go']['app']['ComposerApp']['GetOriginalMessage']();
 }
 
+export function GetSystemTheme() {
+  return window['go']['app']['ComposerApp']['GetSystemTheme']();
+}
+
 export function GetThemeMode() {
   return window['go']['app']['ComposerApp']['GetThemeMode']();
 }

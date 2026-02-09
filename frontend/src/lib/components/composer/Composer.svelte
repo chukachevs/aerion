@@ -798,21 +798,43 @@
     }
   }
   
-  // Attachment handling
-  async function handleAttachFiles() {
-    try {
-      const files = await api.pickAttachmentFiles()
-      if (files && files.length > 0) {
-        attachments = [...attachments, ...files]
-        scheduleDraftSave()
+  // Attachment handling — uses HTML file input so WebKitGTK routes through
+  // the FileChooser portal (required for Flatpak sandbox file access)
+  function handleAttachFiles() {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.multiple = true
+    input.onchange = async (e) => {
+      const fileList = (e.target as HTMLInputElement).files
+      if (!fileList || fileList.length === 0) return
+
+      try {
+        const newAttachments: typeof attachments = []
+        for (const file of Array.from(fileList)) {
+          const dataUrl = await readFileAsDataUrl(file)
+          const matches = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+          if (!matches) continue
+
+          newAttachments.push({
+            filename: file.name,
+            contentType: matches[1],
+            size: file.size,
+            data: matches[2],
+          })
+        }
+        if (newAttachments.length > 0) {
+          attachments = [...attachments, ...newAttachments]
+          scheduleDraftSave()
+        }
+      } catch (err) {
+        console.error('Failed to attach files:', err)
+        addToast({
+          type: 'error',
+          message: 'Failed to attach files',
+        })
       }
-    } catch (err) {
-      console.error('Failed to pick files:', err)
-      addToast({
-        type: 'error',
-        message: 'Failed to attach files',
-      })
     }
+    input.click()
   }
   
   function removeAttachment(index: number) {

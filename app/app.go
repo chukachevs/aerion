@@ -111,6 +111,9 @@ type App struct {
 	// Sleep/wake detection for auto-sync on wake
 	sleepWakeMonitor platform.SleepWakeMonitor
 
+	// System theme detection (XDG Settings Portal on Linux)
+	themeMonitor platform.ThemeMonitor
+
 	// Desktop notifications with click handling
 	notifier notification.Notifier
 
@@ -304,6 +307,9 @@ func (a *App) Startup(ctx context.Context) {
 	// Initialize sleep/wake monitor for auto-sync on wake
 	a.initSleepWakeMonitor(ctx)
 
+	// Initialize system theme monitor (XDG Settings Portal on Linux)
+	a.initThemeMonitor(ctx)
+
 	// Set up FTS progress callback to emit events to frontend
 	a.ftsIndexer.SetProgressCallback(func(folderID string, indexed, total int) {
 		percentage := 0
@@ -417,6 +423,12 @@ func (a *App) Shutdown(ctx context.Context) {
 	if a.sleepWakeMonitor != nil {
 		a.sleepWakeMonitor.Stop()
 		log.Info().Msg("Sleep/wake monitor stopped")
+	}
+
+	// Stop theme monitor
+	if a.themeMonitor != nil {
+		a.themeMonitor.Stop()
+		log.Info().Msg("Theme monitor stopped")
 	}
 
 	// Stop notification listener

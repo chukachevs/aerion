@@ -298,6 +298,10 @@ export function GetSpecialFolder(arg1, arg2) {
   return window['go']['app']['App']['GetSpecialFolder'](arg1, arg2);
 }
 
+export function GetSystemTheme() {
+  return window['go']['app']['App']['GetSystemTheme']();
+}
+
 export function GetTermsAccepted() {
   return window['go']['app']['App']['GetTermsAccepted']();
 }
