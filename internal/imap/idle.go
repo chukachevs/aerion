@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -262,14 +263,37 @@ func (ic *IdleConnection) ensureConnected(ctx context.Context) error {
 
 	switch SecurityType(creds.Security) {
 	case SecurityTLS:
-		client, err = imapclient.DialTLS(addr, options)
+		if creds.TLSConfig != nil {
+			// Use custom TLS config (certificate TOFU) with manual dial
+			dialer := &net.Dialer{Timeout: 30 * time.Second}
+			rawConn, dialErr := tls.DialWithDialer(dialer, "tcp", addr, creds.TLSConfig)
+			if dialErr != nil {
+				return fmt.Errorf("failed to connect with TLS: %w", dialErr)
+			}
+			client = imapclient.New(rawConn, options)
+		} else {
+			client, err = imapclient.DialTLS(addr, options)
+		}
 	case SecurityStartTLS:
-		options.TLSConfig = &tls.Config{ServerName: creds.Host}
+		if creds.TLSConfig != nil {
+			options.TLSConfig = creds.TLSConfig
+		} else {
+			options.TLSConfig = &tls.Config{ServerName: creds.Host}
+		}
 		client, err = imapclient.DialStartTLS(addr, options)
 	case SecurityNone:
 		client, err = imapclient.DialInsecure(addr, options)
 	default:
-		client, err = imapclient.DialTLS(addr, options)
+		if creds.TLSConfig != nil {
+			dialer := &net.Dialer{Timeout: 30 * time.Second}
+			rawConn, dialErr := tls.DialWithDialer(dialer, "tcp", addr, creds.TLSConfig)
+			if dialErr != nil {
+				return fmt.Errorf("failed to connect with TLS: %w", dialErr)
+			}
+			client = imapclient.New(rawConn, options)
+		} else {
+			client, err = imapclient.DialTLS(addr, options)
+		}
 	}
 
 	if err != nil {

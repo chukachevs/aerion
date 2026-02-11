@@ -505,4 +505,21 @@ var migrations = []Migration{
 			CREATE INDEX idx_contact_sources_account ON contact_sources(account_id);
 		`,
 	},
+	{
+		Version: 18,
+		SQL: `
+			-- Trusted certificates table for certificate trust-on-first-use (TOFU)
+			-- Trust is checked by fingerprint (global). Host is stored for UI filtering.
+			CREATE TABLE IF NOT EXISTS trusted_certificates (
+				id TEXT PRIMARY KEY,
+				fingerprint TEXT NOT NULL UNIQUE,
+				host TEXT NOT NULL DEFAULT '',
+				subject TEXT NOT NULL,
+				issuer TEXT NOT NULL,
+				not_before DATETIME,
+				not_after DATETIME,
+				accepted_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			);
+		`,
+	},
 }

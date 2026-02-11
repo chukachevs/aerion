@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/hkdb/aerion/internal/account"
+	"github.com/hkdb/aerion/internal/certificate"
 	"github.com/hkdb/aerion/internal/logging"
 	"github.com/hkdb/aerion/internal/settings"
 	"github.com/hkdb/aerion/internal/smtp"
@@ -179,10 +180,11 @@ func (a *App) SendReadReceipt(accountID, messageID string) error {
 
 	// Create SMTP config
 	smtpConfig := smtp.ClientConfig{
-		Host:     acc.SMTPHost,
-		Port:     acc.SMTPPort,
-		Username: acc.Username,
-		Security: smtp.SecurityType(acc.SMTPSecurity),
+		Host:      acc.SMTPHost,
+		Port:      acc.SMTPPort,
+		Username:  acc.Username,
+		Security:  smtp.SecurityType(acc.SMTPSecurity),
+		TLSConfig: certificate.BuildTLSConfig(acc.SMTPHost, a.certStore),
 	}
 
 	// Handle authentication based on auth type

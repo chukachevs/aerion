@@ -30,6 +30,8 @@ export function PickAttachmentFiles():Promise<Array<app.ComposerAttachment>>;
 
 export function PrepareReply():Promise<smtp.ComposeMessage>;
 
+export function RefreshWindowConstraints():Promise<void>;
+
 export function SaveDraft(arg1:smtp.ComposeMessage,arg2:string):Promise<draft.Draft>;
 
 export function SearchContacts(arg1:string,arg2:number):Promise<Array<contact.Contact>>;

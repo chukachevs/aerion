@@ -10,11 +10,12 @@
   import { createComposerWindowApi } from '$lib/composerApi'
   import { getShowTitleBar, type ThemeMode } from '$lib/stores/settings.svelte'
   // @ts-ignore - wailsjs imports
-  import { GetComposeMode, PrepareReply, GetDraft, CloseWindow, GetThemeMode, GetSystemTheme } from '../wailsjs/go/app/ComposerApp.js'
+  import { GetComposeMode, PrepareReply, GetDraft, CloseWindow, GetThemeMode, GetSystemTheme, RefreshWindowConstraints } from '../wailsjs/go/app/ComposerApp.js'
   // @ts-ignore - wailsjs imports
   import { smtp, app } from '../wailsjs/go/models'
   // @ts-ignore - wailsjs runtime
   import { WindowMinimise, WindowToggleMaximise, WindowShow, Quit, EventsOn, EventsOff } from '../wailsjs/runtime/runtime'
+  import { monitorScreenChanges } from '$lib/utils/window'
 
   // Theme state - follows system preference or main window theme
   let theme = $state<ThemeMode>('light')
@@ -77,6 +78,9 @@
 
     // Show window after theme is applied (prevents white flash on startup)
     WindowShow()
+
+    // Re-evaluate window max size constraints when display configuration changes
+    monitorScreenChanges(() => RefreshWindowConstraints())
 
     // Listen for system theme changes (only applies when mode is 'system')
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')

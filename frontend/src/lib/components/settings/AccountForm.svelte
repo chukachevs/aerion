@@ -22,9 +22,11 @@
   } from '$lib/config/providers'
   import { oauthStore } from '$lib/stores/oauth.svelte'
   // @ts-ignore - wailsjs path
-  import { account } from '../../../../wailsjs/go/models'
+  import { account, certificate } from '../../../../wailsjs/go/models'
   // @ts-ignore - wailsjs path
-  import { GetAccountFoldersForMapping, GetAutoDetectedFolders, GetIdentities } from '../../../../wailsjs/go/app/App'
+  import { GetAccountFoldersForMapping, GetAutoDetectedFolders, GetIdentities, AcceptCertificate } from '../../../../wailsjs/go/app/App'
+  import CertificateDialog from './CertificateDialog.svelte'
+  import { accountStore } from '$lib/stores/accounts.svelte'
 
   // OAuth credentials to pass to parent
   export interface OAuthCredentials {
@@ -114,6 +116,10 @@
   let submitting = $state(false)
   let errors = $state<Record<string, string>>({})
   let initialized = $state(false)
+
+  // Certificate TOFU state
+  let showCertDialog = $state(false)
+  let pendingCertificate = $state<certificate.CertificateInfo | null>(null)
 
   // Folder mapping state
   let showFolderMapping = $state(false)
@@ -429,8 +435,15 @@
     testResult = null
 
     try {
-      await onTestConnection?.(buildConfig())
-      testResult = { success: true, message: 'Connection successful!' }
+      const result = await accountStore.testConnection(buildConfig())
+      if (result.success) {
+        testResult = { success: true, message: 'Connection successful!' }
+      } else if (result.certificateRequired && result.certificate) {
+        pendingCertificate = result.certificate
+        showCertDialog = true
+      } else {
+        testResult = { success: false, message: result.error || 'Connection failed' }
+      }
     } catch (err) {
       testResult = {
         success: false,
@@ -439,6 +452,28 @@
     } finally {
       testing = false
     }
+  }
+
+  async function handleCertAcceptOnce() {
+    if (!pendingCertificate) return
+    await AcceptCertificate(imapHost, pendingCertificate, false)
+    showCertDialog = false
+    pendingCertificate = null
+    handleTestConnection()
+  }
+
+  async function handleCertAcceptPermanently() {
+    if (!pendingCertificate) return
+    await AcceptCertificate(imapHost, pendingCertificate, true)
+    showCertDialog = false
+    pendingCertificate = null
+    handleTestConnection()
+  }
+
+  function handleCertDecline() {
+    showCertDialog = false
+    pendingCertificate = null
+    testResult = { success: false, message: 'Certificate declined' }
   }
 
   // Submit form
@@ -1171,3 +1206,11 @@
     </div>
   {/if}
 </form>
+
+<CertificateDialog
+  bind:open={showCertDialog}
+  certificate={pendingCertificate}
+  onAcceptOnce={handleCertAcceptOnce}
+  onAcceptPermanently={handleCertAcceptPermanently}
+  onDecline={handleCertDecline}
+/>

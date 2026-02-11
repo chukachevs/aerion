@@ -45,10 +45,21 @@
   // Loading placeholder SVG
   const loadingPlaceholder = `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='80' viewBox='0 0 120 80'%3E%3Crect fill='%23f3f4f6' width='120' height='80' rx='4'/%3E%3Cg transform='translate(60,40)'%3E%3Ccircle cx='0' cy='0' r='12' fill='none' stroke='%239ca3af' stroke-width='2' stroke-dasharray='20 10'%3E%3CanimateTransform attributeName='transform' type='rotate' from='0' to='360' dur='1s' repeatCount='indefinite'/%3E%3C/circle%3E%3C/g%3E%3Ctext x='60' y='65' text-anchor='middle' fill='%239ca3af' font-size='9' font-family='sans-serif'%3ELoading...%3C/text%3E%3C/svg%3E`
 
+  // Regex pattern for CSS url() with remote http(s) URLs.
+  // Handles all quote styles: raw ' or ", decimal &#39;/&#34;, hex &#x27;/&#x22;, named &apos;/&quot;
+  // Used as a string so we can create fresh RegExp instances (avoids lastIndex issues with /g)
+  const CSS_QUOTE = `(?:['"]|&#(?:39|x27|34|x22);|&(?:apos|quot);)?`
+  const CSS_REMOTE_URL_PATTERN = `url\\(\\s*${CSS_QUOTE}\\s*https?://[^)]*?${CSS_QUOTE}\\s*\\)`
+
   function checkForRemoteImages(html: string): boolean {
     if (!html) return false
-    const remoteImagePattern = /<img[^>]+src=["'](https?:\/\/[^"']+)["']/gi
-    return remoteImagePattern.test(html)
+    // Check <img> tags with remote src
+    if (/<img[^>]+src=["'](https?:\/\/[^"']+)["']/i.test(html)) return true
+    // Check CSS url() references with remote URLs (background-image, background, etc.)
+    if (new RegExp(CSS_REMOTE_URL_PATTERN, 'i').test(html)) return true
+    // Check HTML background attribute with remote URLs
+    if (/\bbackground\s*=\s*["'](https?:\/\/[^"']+)["']/i.test(html)) return true
+    return false
   }
 
   function processCidReferences(html: string): string {
@@ -63,12 +74,21 @@
     if (!html) return ''
     let processed = processCidReferences(html)
     if (blockImages) {
+      // Block <img> tags with remote sources
       processed = processed.replace(
         /(<img[^>]+)src=["'](https?:\/\/[^"']+)["']([^>]*>)/gi,
         (match, before, src, after) => {
           const placeholder = `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='60' viewBox='0 0 100 60'%3E%3Crect fill='%23e5e7eb' width='100' height='60'/%3E%3Ctext x='50' y='35' text-anchor='middle' fill='%239ca3af' font-size='10' font-family='sans-serif'%3EImage blocked%3C/text%3E%3C/svg%3E`
           return `${before}src="${placeholder}" data-blocked-src="${encodeURIComponent(src)}"${after}`
         }
+      )
+      // Block remote URLs in CSS url() references (covers background-image, background, etc.)
+      // Handles all quote encodings: raw, decimal entities, hex entities, named entities
+      processed = processed.replace(new RegExp(CSS_REMOTE_URL_PATTERN, 'gi'), 'url()')
+      // Block HTML background attribute with remote URLs
+      processed = processed.replace(
+        /\bbackground\s*=\s*["'](https?:\/\/[^"']+)["']/gi,
+        'background=""'
       )
     }
     return processed
@@ -230,8 +250,11 @@
       font-family: system-ui, sans-serif;
       font-size: 14px; line-height: 1.5;
       color: #1a1a0a; background-color: white;
-      overflow-x: hidden; word-wrap: break-word;
+      overflow-x: auto; word-wrap: break-word;
+      scrollbar-width: none; /* Firefox */
+      -ms-overflow-style: none; /* IE/Edge */
     }
+    html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; /* Chrome/Safari/WebKit */ }
     body { padding: 16px; }
     img { max-width: 100%; height: auto; }
     img[data-cid] { min-width: 100px; min-height: 60px; }

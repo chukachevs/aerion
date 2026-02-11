@@ -167,7 +167,7 @@ func blockRemoteImages(html string) string {
 	// Match img tags with http/https sources
 	re := regexp.MustCompile(`(?i)<img([^>]*)\ssrc=["'](https?://[^"']+)["']([^>]*)>`)
 
-	return re.ReplaceAllStringFunc(html, func(match string) string {
+	result := re.ReplaceAllStringFunc(html, func(match string) string {
 		// Extract the original src
 		srcRe := regexp.MustCompile(`(?i)src=["'](https?://[^"']+)["']`)
 		srcMatch := srcRe.FindStringSubmatch(match)
@@ -180,6 +180,17 @@ func blockRemoteImages(html string) string {
 		// Replace with a placeholder, storing original URL in data attribute
 		return srcRe.ReplaceAllString(match, `src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Crect fill='%23ddd' width='100' height='100'/%3E%3Ctext x='50%25' y='50%25' text-anchor='middle' dy='.3em' fill='%23666' font-size='12'%3EImage blocked%3C/text%3E%3C/svg%3E" data-original-src="`+escapeHTML(originalSrc)+`"`)
 	})
+
+	// Block remote URLs in CSS url() references (background-image, background, etc.)
+	// Handles all quote encodings: raw, decimal (&#39;/&#34;), hex (&#x27;/&#x22;), named (&apos;/&quot;)
+	cssURLRe := regexp.MustCompile(`(?i)url\(\s*(?:['"]|&#(?:39|x27|34|x22);|&(?:apos|quot);)?\s*https?://[^)]*?(?:['"]|&#(?:39|x27|34|x22);|&(?:apos|quot);)?\s*\)`)
+	result = cssURLRe.ReplaceAllString(result, `url()`)
+
+	// Block HTML background attribute with remote URLs
+	bgAttrRe := regexp.MustCompile(`(?i)\bbackground\s*=\s*["'](https?://[^"']+)["']`)
+	result = bgAttrRe.ReplaceAllString(result, `background=""`)
+
+	return result
 }
 
 // UnblockRemoteImages restores original image sources from data attributes

@@ -12,6 +12,7 @@ import (
 
 	goImap "github.com/emersion/go-imap/v2"
 	"github.com/hkdb/aerion/internal/account"
+	"github.com/hkdb/aerion/internal/certificate"
 	"github.com/hkdb/aerion/internal/contact"
 	"github.com/hkdb/aerion/internal/credentials"
 	"github.com/hkdb/aerion/internal/database"
@@ -66,6 +67,7 @@ type ComposerApp struct {
 	contactStore  *contact.Store
 	draftStore    *draft.Store
 	credStore     *credentials.Store
+	certStore     *certificate.Store
 	settingsStore *settings.Store
 
 	// IMAP pool for sending/draft operations
@@ -140,6 +142,9 @@ func (c *ComposerApp) Startup(ctx context.Context) {
 		log.Fatal().Err(err).Msg("Failed to initialize credential store")
 	}
 	c.credStore = credStore
+
+	// Initialize certificate trust store (TOFU)
+	c.certStore = certificate.NewStore(db.DB)
 
 	// Initialize IMAP pool for send/draft operations
 	poolConfig := imap.DefaultPoolConfig()
@@ -407,6 +412,7 @@ func (c *ComposerApp) getIMAPCredentials(accountID string) (*imap.ClientConfig, 
 	config.Port = acc.IMAPPort
 	config.Security = imap.SecurityType(acc.IMAPSecurity)
 	config.Username = acc.Username
+	config.TLSConfig = certificate.BuildTLSConfig(acc.IMAPHost, c.certStore)
 
 	// Handle authentication based on auth type
 	if acc.AuthType == account.AuthOAuth2 {
@@ -620,6 +626,7 @@ func (c *ComposerApp) SendMessage(msg smtp.ComposeMessage) error {
 	smtpConfig.Port = acc.SMTPPort
 	smtpConfig.Security = smtp.SecurityType(acc.SMTPSecurity)
 	smtpConfig.Username = acc.Username
+	smtpConfig.TLSConfig = certificate.BuildTLSConfig(acc.SMTPHost, c.certStore)
 
 	// Handle authentication based on auth type
 	if acc.AuthType == account.AuthOAuth2 {
@@ -726,6 +733,7 @@ func (c *ComposerApp) saveToSentFolder(acc *account.Account, rawMsg []byte) erro
 	clientConfig.Port = acc.IMAPPort
 	clientConfig.Security = imap.SecurityType(acc.IMAPSecurity)
 	clientConfig.Username = acc.Username
+	clientConfig.TLSConfig = certificate.BuildTLSConfig(acc.IMAPHost, c.certStore)
 
 	// Handle authentication
 	if acc.AuthType == account.AuthOAuth2 {

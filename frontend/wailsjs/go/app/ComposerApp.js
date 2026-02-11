@@ -46,6 +46,10 @@ export function PrepareReply() {
   return window['go']['app']['ComposerApp']['PrepareReply']();
 }
 
+export function RefreshWindowConstraints() {
+  return window['go']['app']['ComposerApp']['RefreshWindowConstraints']();
+}
+
 export function SaveDraft(arg1, arg2) {
   return window['go']['app']['ComposerApp']['SaveDraft'](arg1, arg2);
 }

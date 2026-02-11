@@ -11,6 +11,7 @@ import (
 	"github.com/hkdb/aerion/internal/account"
 	"github.com/hkdb/aerion/internal/appstate"
 	"github.com/hkdb/aerion/internal/carddav"
+	"github.com/hkdb/aerion/internal/certificate"
 	"github.com/hkdb/aerion/internal/contact"
 	"github.com/hkdb/aerion/internal/credentials"
 	"github.com/hkdb/aerion/internal/database"
@@ -69,6 +70,9 @@ type App struct {
 
 	// Credentials (keyring with fallback)
 	credStore *credentials.Store
+
+	// Certificate trust store (TOFU)
+	certStore *certificate.Store
 
 	// CardDAV
 	carddavStore     *carddav.Store
@@ -211,6 +215,9 @@ func (a *App) Startup(ctx context.Context) {
 		log.Fatal().Err(err).Msg("Failed to initialize credential store")
 	}
 	a.credStore = credStore
+
+	// Initialize certificate trust store (TOFU)
+	a.certStore = certificate.NewStore(db.DB)
 
 	// Initialize IMAP connection pool
 	poolConfig := imap.DefaultPoolConfig()
@@ -496,6 +503,7 @@ func (a *App) getIMAPCredentials(accountID string) (*imap.ClientConfig, error) {
 	config.Port = acc.IMAPPort
 	config.Security = imap.SecurityType(acc.IMAPSecurity)
 	config.Username = acc.Username
+	config.TLSConfig = certificate.BuildTLSConfig(acc.IMAPHost, a.certStore)
 
 	// Handle authentication based on auth type
 	if acc.AuthType == account.AuthOAuth2 {

@@ -10,6 +10,7 @@
   import Composer from './lib/components/composer/Composer.svelte'
   import ToastContainer from './lib/components/ui/toast/ToastContainer.svelte'
   import TermsDialog from './lib/components/TermsDialog.svelte'
+  import CertificateDialog from './lib/components/settings/CertificateDialog.svelte'
   import { accountStore } from '$lib/stores/accounts.svelte'
   import { addToast } from '$lib/stores/toast'
   import { loadSettings, getThemeMode, getShowTitleBar, type ThemeMode } from '$lib/stores/settings.svelte'
@@ -24,14 +25,15 @@
     isInputElement 
   } from '$lib/stores/keyboard.svelte'
   // @ts-ignore - wailsjs path
-  import { PrepareReply, GetPendingMailto, GetDraft, Trash, DeletePermanently, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted, GetSystemTheme } from '../wailsjs/go/app/App.js'
+  import { PrepareReply, GetPendingMailto, GetDraft, Trash, DeletePermanently, MarkAsRead, MarkAsUnread, Star, Unstar, Archive, MarkAsSpam, MarkAsNotSpam, Undo, GetTermsAccepted, SetTermsAccepted, GetSystemTheme, RefreshWindowConstraints, AcceptCertificate } from '../wailsjs/go/app/App.js'
   // @ts-ignore - wailsjs path
-  import { smtp, folder } from '../wailsjs/go/models'
+  import { smtp, folder, certificate } from '../wailsjs/go/models'
   // @ts-ignore - wailsjs runtime
   import { WindowShow, EventsOn } from '../wailsjs/runtime/runtime'
   // @ts-ignore - wailsjs path
   import { InitiateShutdown } from '../wailsjs/go/app/App.js'
-  
+  import { monitorScreenChanges } from '$lib/utils/window'
+
   // Component refs for keyboard navigation
   let sidebarRef: Sidebar | null = null
   let messageListRef: MessageList | null = null
@@ -76,6 +78,11 @@
   // Terms acceptance state
   let showTermsDialog = $state(false)
 
+  // Certificate TOFU state (for background sync cert errors)
+  let showCertDialog = $state(false)
+  let pendingCertificate = $state<certificate.CertificateInfo | null>(null)
+  let pendingCertAccountId = $state<string | null>(null)
+
   // Handle graceful shutdown with overlay
   function handleShutdown() {
     isShuttingDown = true
@@ -90,6 +97,42 @@
     } catch (err) {
       console.error('Failed to save terms acceptance:', err)
     }
+  }
+
+  // Certificate TOFU handlers for background sync
+  async function handleBgCertAcceptOnce() {
+    if (!pendingCertificate || !pendingCertAccountId) return
+    try {
+      // Look up the account's IMAP host for the accept call
+      const acc = accountStore.accounts.find(a => a.account.id === pendingCertAccountId)
+      const host = acc?.account.imapHost || ''
+      await AcceptCertificate(host, pendingCertificate, false)
+    } catch (err) {
+      console.error('Failed to accept certificate:', err)
+    }
+    showCertDialog = false
+    pendingCertificate = null
+    pendingCertAccountId = null
+  }
+
+  async function handleBgCertAcceptPermanently() {
+    if (!pendingCertificate || !pendingCertAccountId) return
+    try {
+      const acc = accountStore.accounts.find(a => a.account.id === pendingCertAccountId)
+      const host = acc?.account.imapHost || ''
+      await AcceptCertificate(host, pendingCertificate, true)
+    } catch (err) {
+      console.error('Failed to accept certificate:', err)
+    }
+    showCertDialog = false
+    pendingCertificate = null
+    pendingCertAccountId = null
+  }
+
+  function handleBgCertDecline() {
+    showCertDialog = false
+    pendingCertificate = null
+    pendingCertAccountId = null
   }
 
   // Helper to find folder info by ID from account store
@@ -153,6 +196,16 @@
     // Listen for shutdown event from backend (triggered by OS close signal)
     EventsOn('app:shutting-down', () => {
       isShuttingDown = true
+    })
+
+    // Listen for untrusted certificate events from background sync
+    EventsOn('certificate:untrusted', (data: { accountId: string; certificate: certificate.CertificateInfo }) => {
+      // Only show if not already showing a cert dialog
+      if (!showCertDialog) {
+        pendingCertificate = data.certificate
+        pendingCertAccountId = data.accountId
+        showCertDialog = true
+      }
     })
 
     // Listen for escape-iframe-focus event (from EmailBody when navigating away from iframe)
@@ -243,6 +296,9 @@
 
     // Show window after UI is ready (prevents white flash on startup)
     WindowShow()
+
+    // Re-evaluate window max size constraints when display configuration changes
+    monitorScreenChanges(() => RefreshWindowConstraints())
 
     // Check for pending mailto: URL from command line
     try {
@@ -1079,3 +1135,12 @@
 
 <!-- Terms Acceptance Dialog -->
 <TermsDialog bind:open={showTermsDialog} onAccept={handleTermsAccepted} />
+
+<!-- Certificate TOFU Dialog (for background sync cert errors) -->
+<CertificateDialog
+  bind:open={showCertDialog}
+  certificate={pendingCertificate}
+  onAcceptOnce={handleBgCertAcceptOnce}
+  onAcceptPermanently={handleBgCertAcceptPermanently}
+  onDecline={handleBgCertDecline}
+/>

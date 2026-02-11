@@ -17,7 +17,7 @@
       <li>OAuth2 authentication for Gmail and Microsoft accounts</li>
       <li>Conversation threading</li>
       <li>Rich text WYSIWYG composer with TipTap editor</li>
-      <li>Contact sync (CardDAV, Google, Microsoft)</li>
+      <li>Contact sync (CardDAV, Google, Microsoft) for auto-completion</li>
       <li>Dark mode and multiple color themes</li>
       <li>Keyboard-friendly navigation with vim-style shortcuts</li>
       <li>Detachable composer window</li>
@@ -63,6 +63,17 @@
   </provides>
 
   <releases>
+    <release version="0.1.20" date="2026-02-11">
+      <description>
+        <ul>
+          <li>Added resolution change detection</li>
+          <li>Added trusted self-signed cert flow and store</li>
+          <li>Improvied imap login logic</li>
+          <li>Improved image blocking to include CSS loaded images</li>
+          <li>Enabled horizontal scrolling in conversation viewer</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.19" date="2026-02-09">
       <description>
         <ul>

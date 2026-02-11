@@ -1,9 +1,11 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/hkdb/aerion/internal/account"
+	"github.com/hkdb/aerion/internal/certificate"
 	"github.com/hkdb/aerion/internal/imap"
 	"github.com/hkdb/aerion/internal/logging"
 )
@@ -222,25 +224,32 @@ func (a *App) SetDefaultIdentity(accountID, identityID string) error {
 // Connection Testing
 // ============================================================================
 
+// ConnectionTestResult holds the result of a connection test
+type ConnectionTestResult struct {
+	Success             bool                      `json:"success"`
+	Error               string                    `json:"error,omitempty"`
+	CertificateRequired bool                      `json:"certificateRequired"`
+	Certificate         *certificate.CertificateInfo `json:"certificate,omitempty"`
+}
+
 // TestConnection tests the IMAP/SMTP connection for an account config
 // For OAuth2 accounts, this only tests connectivity (no login) since the user
 // hasn't authenticated yet during account creation.
-func (a *App) TestConnection(config account.AccountConfig) error {
+func (a *App) TestConnection(config account.AccountConfig) ConnectionTestResult {
 	log := logging.WithComponent("app")
 
 	// Validate config first
 	if err := config.Validate(); err != nil {
-		return err
+		return ConnectionTestResult{Error: err.Error()}
 	}
 
 	// For OAuth2 accounts, skip login test during account creation
-	// The actual authentication will happen during the OAuth flow
 	if config.AuthType == account.AuthOAuth2 {
 		log.Info().
 			Str("host", config.IMAPHost).
 			Str("authType", string(config.AuthType)).
 			Msg("Skipping connection test for OAuth2 account (will test after authorization)")
-		return nil
+		return ConnectionTestResult{Success: true}
 	}
 
 	// Create a temporary IMAP client to test connection
@@ -251,20 +260,28 @@ func (a *App) TestConnection(config account.AccountConfig) error {
 	clientConfig.Username = config.Username
 	clientConfig.Password = config.Password
 	clientConfig.AuthType = imap.AuthTypePassword
+	clientConfig.TLSConfig = certificate.BuildTLSConfig(config.IMAPHost, a.certStore)
 
 	client := imap.NewClient(clientConfig)
 
 	if err := client.Connect(); err != nil {
+		var certErr *certificate.Error
+		if errors.As(err, &certErr) {
+			return ConnectionTestResult{
+				CertificateRequired: true,
+				Certificate:         certErr.Info,
+			}
+		}
 		log.Error().Err(err).Msg("Connection test failed")
-		return fmt.Errorf("failed to connect: %w", err)
+		return ConnectionTestResult{Error: fmt.Sprintf("failed to connect: %v", err)}
 	}
 	defer client.Close()
 
 	if err := client.Login(); err != nil {
 		log.Error().Err(err).Msg("Login test failed")
-		return fmt.Errorf("failed to login: %w", err)
+		return ConnectionTestResult{Error: fmt.Sprintf("failed to login: %v", err)}
 	}
 
 	log.Info().Str("host", config.IMAPHost).Msg("Connection test successful")
-	return nil
+	return ConnectionTestResult{Success: true}
 }

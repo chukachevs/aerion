@@ -12,7 +12,7 @@ import {
   CompleteOAuthAccountSetup,
   ReorderAccounts,
 } from '../../../wailsjs/go/app/App'
-import { account, folder } from '../../../wailsjs/go/models'
+import { account, app, folder } from '../../../wailsjs/go/models'
 // @ts-ignore - wailsjs runtime
 import { EventsOn } from '../../../wailsjs/runtime/runtime'
 
@@ -435,8 +435,8 @@ class AccountStore {
   /**
    * Test connection with provided config
    */
-  async testConnection(config: account.AccountConfig): Promise<void> {
-    await TestConnection(config)
+  async testConnection(config: account.AccountConfig): Promise<app.ConnectionTestResult> {
+    return await TestConnection(config)
   }
 
   /**

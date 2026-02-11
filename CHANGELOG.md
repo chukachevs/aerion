@@ -1,5 +1,15 @@
 # CHANGELOG
 
+**v0.1.20 - 02-11-2026**
+---
+
+- Added resolution change detection - [#4](https://github.com/hkdb/aerion/issues/4)
+- Added trusted self-signed cert flow and store - [#6](https://github.com/hkdb/aerion/issues/6)
+- Improved imap login logic
+- Improved image blocking to include CSS loaded images
+- Enabled horizontal scroll in conversation viewer
+    
+
 **v0.1.19 - 02-09-2026**
 ---
 

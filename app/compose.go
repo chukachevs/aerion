@@ -10,6 +10,7 @@ import (
 
 	goImap "github.com/emersion/go-imap/v2"
 	"github.com/hkdb/aerion/internal/account"
+	"github.com/hkdb/aerion/internal/certificate"
 	"github.com/hkdb/aerion/internal/folder"
 	"github.com/hkdb/aerion/internal/imap"
 	"github.com/hkdb/aerion/internal/logging"
@@ -63,6 +64,7 @@ func (a *App) SendMessage(accountID string, msg smtp.ComposeMessage) error {
 	smtpConfig.Port = acc.SMTPPort
 	smtpConfig.Security = smtp.SecurityType(acc.SMTPSecurity)
 	smtpConfig.Username = acc.Username
+	smtpConfig.TLSConfig = certificate.BuildTLSConfig(acc.SMTPHost, a.certStore)
 
 	// Handle authentication based on auth type
 	if acc.AuthType == account.AuthOAuth2 {
@@ -202,6 +204,7 @@ func (a *App) saveToSentFolder(accountID string, acc *account.Account, rawMsg []
 	clientConfig.Port = acc.IMAPPort
 	clientConfig.Security = imap.SecurityType(acc.IMAPSecurity)
 	clientConfig.Username = acc.Username
+	clientConfig.TLSConfig = certificate.BuildTLSConfig(acc.IMAPHost, a.certStore)
 
 	// Handle authentication based on auth type
 	if acc.AuthType == account.AuthOAuth2 {
@@ -422,6 +425,7 @@ func (a *App) TestSMTPConnection(host string, port int, security, username, pass
 	config.Username = username
 	config.Password = password
 	config.AuthType = smtp.AuthTypePassword
+	config.TLSConfig = certificate.BuildTLSConfig(host, a.certStore)
 
 	client := smtp.NewClient(config)
 

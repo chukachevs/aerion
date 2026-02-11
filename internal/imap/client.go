@@ -69,6 +69,9 @@ type ClientConfig struct {
 	ConnectTimeout time.Duration
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
+
+	// TLS config (optional, used for certificate TOFU verification)
+	TLSConfig *tls.Config
 }
 
 // DefaultConfig returns a ClientConfig with sensible defaults
@@ -121,8 +124,11 @@ func (c *Client) Connect() error {
 	switch c.config.Security {
 	case SecurityTLS:
 		// Connect with TLS directly (port 993)
-		// Use manual connection creation to apply read/write timeouts
-		tlsConfig := &tls.Config{ServerName: c.config.Host}
+		// Use custom TLSConfig if provided (for certificate TOFU), otherwise default
+		tlsConfig := c.config.TLSConfig
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{ServerName: c.config.Host}
+		}
 		rawConn, dialErr := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 		if dialErr != nil {
 			return fmt.Errorf("failed to connect with TLS: %w", dialErr)
@@ -139,8 +145,10 @@ func (c *Client) Connect() error {
 
 	case SecurityStartTLS:
 		// Connect plain first, then upgrade (port 143)
-		// For STARTTLS we still use DialStartTLS since it handles the upgrade handshake
-		// TODO: Implement manual STARTTLS with deadline wrapper if needed
+		// Use custom TLSConfig if provided (for certificate TOFU)
+		if c.config.TLSConfig != nil {
+			options.TLSConfig = c.config.TLSConfig
+		}
 		c.client, err = imapclient.DialStartTLS(addr, options)
 		if err != nil {
 			return fmt.Errorf("failed to connect with STARTTLS: %w", err)
@@ -232,19 +240,25 @@ func (c *Client) Login() error {
 	return nil
 }
 
-// loginPassword authenticates using password (SASL PLAIN or LOGIN command)
+// loginPassword authenticates using password (LOGIN or SASL PLAIN)
 func (c *Client) loginPassword() error {
-	// Use SASL PLAIN authentication
-	saslClient := sasl.NewPlainClient("", c.config.Username, c.config.Password)
-
-	if err := c.client.Authenticate(saslClient); err != nil {
-		// Fall back to LOGIN command if AUTHENTICATE fails
-		c.log.Debug().Msg("SASL PLAIN failed, trying LOGIN")
-		if err := c.client.Login(c.config.Username, c.config.Password).Wait(); err != nil {
+	// Use LOGIN by default — it's simpler and more compatible.
+	// Only use AUTHENTICATE PLAIN if the server advertises LOGINDISABLED,
+	// since a failed AUTHENTICATE can corrupt the IMAP wire state and
+	// prevent a fallback LOGIN from working (seen with Proton Bridge).
+	if c.caps.Has(imap.CapLoginDisabled) {
+		c.log.Debug().Msg("LOGIN disabled, using AUTHENTICATE PLAIN")
+		saslClient := sasl.NewPlainClient("", c.config.Username, c.config.Password)
+		if err := c.client.Authenticate(saslClient); err != nil {
 			return fmt.Errorf("authentication failed: %w", err)
 		}
+		return nil
 	}
 
+	c.log.Debug().Msg("Using LOGIN command")
+	if err := c.client.Login(c.config.Username, c.config.Password).Wait(); err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
 	return nil
 }
 

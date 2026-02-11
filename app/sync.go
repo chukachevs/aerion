@@ -2,10 +2,12 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/hkdb/aerion/internal/certificate"
 	"github.com/hkdb/aerion/internal/folder"
 	"github.com/hkdb/aerion/internal/logging"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -72,6 +74,17 @@ func (a *App) SyncFolder(accountID, folderID string) error {
 			log.Debug().Str("account", accountID).Str("folder", folderID).Msg("Sync cancelled")
 			return ctx.Err()
 		}
+		// Check for certificate error - emit special event for TOFU dialog
+		var certErr *certificate.Error
+		if errors.As(err, &certErr) {
+			log.Warn().Str("folder", folderID).Str("fingerprint", certErr.Info.Fingerprint).Msg("Untrusted certificate during sync")
+			wailsRuntime.EventsEmit(a.ctx, "certificate:untrusted", map[string]interface{}{
+				"accountId":   accountID,
+				"certificate": certErr.Info,
+			})
+			return err
+		}
+
 		// Actual error - emit error event
 		log.Error().Err(err).Str("folder", folderID).Msg("Header sync failed")
 		wailsRuntime.EventsEmit(a.ctx, "folder:syncError", map[string]interface{}{
