@@ -1,0 +1,58 @@
+name: Question
+description: Ask a question about Aerion
+labels: ["question"]
+body:
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux
+        - Mac
+        - Windows
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Linux Distro
+      description: Required if OS is Linux
+      placeholder: e.g. Ubuntu, Fedora, Arch
+
+  - type: input
+    id: distro-version
+    attributes:
+      label: Linux Distro Version
+      description: Required if OS is Linux
+      placeholder: e.g. 24.04, 41, Rolling
+
+  - type: dropdown
+    id: webkit2gtk
+    attributes:
+      label: Is webkit2gtk 4.1 installed?
+      description: Required if OS is Linux
+      options:
+        - "Yes"
+        - "No"
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install Method
+      options:
+        - Windows Binary
+        - MacOS DMG
+        - Linux Binary
+        - Flatpak
+        - Compile from Source
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is your question?
+    validations:
+      required: true

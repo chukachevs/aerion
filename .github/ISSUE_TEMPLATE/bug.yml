@@ -1,0 +1,86 @@
+name: Bug Report
+description: Report a bug in Aerion
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux
+        - Mac
+        - Windows
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Linux Distro
+      description: Required if OS is Linux
+      placeholder: e.g. Ubuntu, Fedora, Arch
+
+  - type: input
+    id: distro-version
+    attributes:
+      label: Linux Distro Version
+      description: Required if OS is Linux
+      placeholder: e.g. 24.04, 41, Rolling
+
+  - type: dropdown
+    id: webkit2gtk
+    attributes:
+      label: Is webkit2gtk 4.1 installed?
+      description: Required if OS is Linux
+      options:
+        - "Yes"
+        - "No"
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install Method
+      options:
+        - Windows Binary
+        - MacOS DMG
+        - Linux Binary
+        - Flatpak
+        - Compile from Source
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this bug?
+      placeholder: |
+        1. Go to '...'
+        2. Click on '...'
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+    validations:
+      required: true
