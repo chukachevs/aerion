@@ -1,6 +1,6 @@
 # CHANGELOG
 
-**v0.1.21 - 02-13-2026**
+**v0.1.21 - 02-14-2026**
 ---
 
 - Added PGP support - needs more testing
