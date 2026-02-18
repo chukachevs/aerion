@@ -2,10 +2,22 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      os:
+        description: "Select OS to build"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - linux
+          - darwin
+          - windows
 
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
@@ -26,7 +38,18 @@ jobs:
           - os: windows-latest
             platform: windows
             arch: arm64
+
     runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Skip if OS not selected
+        if: github.event.inputs.os != 'all' && github.event.inputs.os != matrix.platform
+        run: |
+          echo "Skipping ${{ matrix.platform }}"
+          exit 0
+
+      - name: Build
+        run: echo "Building for ${{ matrix.platform }} ${{ matrix.arch }}"
     env:
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
