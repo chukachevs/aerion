@@ -28,6 +28,7 @@ These shortcuts work anywhere in the application (unless in composer).
 | `Alt+Up` / `Alt+K` | Navigate to previous folder |
 | `Alt+Down` / `Alt+J` | Navigate to next folder |
 | `Alt+Enter` | Expand/collapse focused account folder tree |
+| `Alt(L)+Alt(R)` | Brings up context menu for the focused folder |
 
 ### Message Actions (when message is selected/focused)
 
@@ -56,6 +57,7 @@ These shortcuts depend on which pane is focused. They are disabled when typing i
 | `Up` / `K` | Navigate to previous folder |
 | `Down` / `J` | Navigate to next folder |
 | `Enter` / `Space` | Expand/collapse account (when account header is focused) |
+| `Alt(R)` | Brings up context menu for the focused folder |
 
 ### Message List
 
@@ -68,6 +70,7 @@ These shortcuts depend on which pane is focused. They are disabled when typing i
 | `Space` | Toggle checkbox on current conversation |
 | `Enter` | Open selected conversation in viewer |
 | `CTRL+A` | Select all messages in folder |
+| `Alt(R)` | Brings up context menu for the selected message(s) |
 
 ### Conversation Viewer
 
@@ -76,6 +79,7 @@ These shortcuts depend on which pane is focused. They are disabled when typing i
 | `Up` / `K` | Scroll up |
 | `Down` / `J` | Scroll down |
 | `Ctrl + A` | Select all text of message in viewport |
+| `Alt(R)` | Brings up context menu for the message focused |
 
 ---
 
@@ -114,6 +118,7 @@ These only work when the composer is open.
 NAVIGATION
   Alt + Arrow Keys    Pane focus (Left/Right) or Folder nav (Up/Down)
   Alt + H/J/K/L       Vim-style: pane (H/L) or folder (J/K)
+  Alt(L) + Alt(R)     Brings context menu up for the focused folder
   Alt + Enter         Expand/collapse account
   Arrow Keys / HJKL   Navigate within focused pane
   Enter               Open conversation / Expand account
@@ -140,6 +145,7 @@ MESSAGE ACTIONS
   Ctrl + J            Spam
   Delete              Trash
   Shift + Delete      Permanent delete
+  Alt(R)              Context Menu
 
 OTHER
   Ctrl + S            Search

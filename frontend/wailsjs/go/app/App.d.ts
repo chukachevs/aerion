@@ -254,6 +254,10 @@ export function LookupPGPKey(arg1:string):Promise<string>;
 
 export function LookupWKD(arg1:string):Promise<string>;
 
+export function MarkAllFolderMessagesAsRead(arg1:string):Promise<void>;
+
+export function MarkAllFolderMessagesAsUnread(arg1:string):Promise<void>;
+
 export function MarkAsNotSpam(arg1:Array<string>):Promise<void>;
 
 export function MarkAsRead(arg1:Array<string>):Promise<void>;

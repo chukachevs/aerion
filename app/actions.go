@@ -58,6 +58,30 @@ func (a *App) MarkAsRead(messageIDs []string) error {
 	return a.setReadStatus(messageIDs, true)
 }
 
+// MarkAllFolderMessagesAsRead marks all unread messages in a folder as read
+func (a *App) MarkAllFolderMessagesAsRead(folderID string) error {
+	ids, err := a.messageStore.GetUnreadMessageIDsByFolder(folderID)
+	if err != nil {
+		return fmt.Errorf("failed to get unread messages: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return a.MarkAsRead(ids)
+}
+
+// MarkAllFolderMessagesAsUnread marks all read messages in a folder as unread
+func (a *App) MarkAllFolderMessagesAsUnread(folderID string) error {
+	ids, err := a.messageStore.GetReadMessageIDsByFolder(folderID)
+	if err != nil {
+		return fmt.Errorf("failed to get read messages: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return a.MarkAsUnread(ids)
+}
+
 // MarkAsUnread marks messages as unread
 func (a *App) MarkAsUnread(messageIDs []string) error {
 	return a.setReadStatus(messageIDs, false)

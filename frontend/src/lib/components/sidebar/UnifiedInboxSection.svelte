@@ -3,6 +3,7 @@
   // @ts-ignore - wailsjs path
   import type { account, folder } from '../../../../wailsjs/go/models'
   import { isUnifiedInboxExpanded, setUnifiedInboxExpanded } from '$lib/stores/uiState.svelte'
+  import FolderContextMenu from './FolderContextMenu.svelte'
 
   interface AccountWithInbox {
     account: account.Account
@@ -108,30 +109,32 @@
     <div class="ml-4 mt-0.5 space-y-0.5">
       {#each accounts as acc (acc.account.id)}
         {#if acc.inbox}
-          <button
-            class="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm transition-colors {isAccountInboxSelected(acc.account.id, acc.inbox.id)
-              ? 'bg-primary/10 text-primary'
-              : 'hover:bg-muted/50 text-muted-foreground hover:text-foreground'}"
-            data-sidebar-item="unified-account"
-            data-folder-id={acc.inbox.id}
-            onclick={() => handleAccountInboxClick(acc)}
-          >
-            <!-- Account Color Dot -->
-            <span
-              class="w-2 h-2 rounded-full flex-shrink-0"
-              style="background-color: {getAccountColor(acc.account)}"
-            ></span>
+          <FolderContextMenu folderId={acc.inbox.id}>
+            <button
+              class="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm transition-colors {isAccountInboxSelected(acc.account.id, acc.inbox.id)
+                ? 'bg-primary/10 text-primary'
+                : 'hover:bg-muted/50 text-muted-foreground hover:text-foreground'}"
+              data-sidebar-item="unified-account"
+              data-folder-id={acc.inbox.id}
+              onclick={() => handleAccountInboxClick(acc)}
+            >
+              <!-- Account Color Dot -->
+              <span
+                class="w-2 h-2 rounded-full flex-shrink-0"
+                style="background-color: {getAccountColor(acc.account)}"
+              ></span>
 
-            <!-- Account Name -->
-            <span class="flex-1 text-left truncate">{acc.account.name}</span>
+              <!-- Account Name -->
+              <span class="flex-1 text-left truncate">{acc.account.name}</span>
 
-            <!-- Unread Badge -->
-            {#if acc.inbox.unreadCount > 0}
-              <span class="px-1.5 py-0.5 text-xs font-medium bg-muted text-muted-foreground rounded-full">
-                {acc.inbox.unreadCount}
-              </span>
-            {/if}
-          </button>
+              <!-- Unread Badge -->
+              {#if acc.inbox.unreadCount > 0}
+                <span class="px-1.5 py-0.5 text-xs font-medium bg-muted text-muted-foreground rounded-full">
+                  {acc.inbox.unreadCount}
+                </span>
+              {/if}
+            </button>
+          </FolderContextMenu>
         {/if}
       {/each}
     </div>

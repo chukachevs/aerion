@@ -272,6 +272,44 @@ func (s *Store) CountUnreadByFolder(folderID string) (int, error) {
 	return count, nil
 }
 
+// GetUnreadMessageIDsByFolder returns the IDs of all unread messages in a folder
+func (s *Store) GetUnreadMessageIDsByFolder(folderID string) ([]string, error) {
+	rows, err := s.db.Query("SELECT id FROM messages WHERE folder_id = ? AND is_read = 0", folderID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query unread messages: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan message id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// GetReadMessageIDsByFolder returns the IDs of all read messages in a folder
+func (s *Store) GetReadMessageIDsByFolder(folderID string) ([]string, error) {
+	rows, err := s.db.Query("SELECT id FROM messages WHERE folder_id = ? AND is_read = 1", folderID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query read messages: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan message id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // Get returns a full message by ID
 func (s *Store) Get(id string) (*Message, error) {
 	query := `

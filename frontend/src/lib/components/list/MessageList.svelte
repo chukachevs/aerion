@@ -859,6 +859,22 @@
     checkedThreadIds = new Set(activeList.map(c => c.threadId))
   }
 
+  // Open context menu for the currently selected conversation row
+  export function openContextMenu() {
+    if (!selectedThreadId || !listContainerRef) return
+    const index = activeList.findIndex(c => c.threadId === selectedThreadId)
+    if (index < 0) return
+    const rows = listContainerRef.querySelectorAll('[data-conversation-row]')
+    const row = rows[index] as HTMLElement | undefined
+    if (!row) return
+    const rect = row.getBoundingClientRect()
+    row.dispatchEvent(new MouseEvent('contextmenu', {
+      bubbles: true,
+      clientX: rect.right,
+      clientY: rect.top + rect.height / 2,
+    }))
+  }
+
   // Permanent delete confirmation state
   let showDeleteConfirm = $state(false)
   let pendingDeleteIds = $state<string[]>([])

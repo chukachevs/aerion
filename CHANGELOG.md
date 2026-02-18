@@ -1,5 +1,15 @@
 # CHANGELOG
 
+**v0.1.24 - 02-18-2026**
+---
+
+- GMail app password fix [#22](https://github.com/hkdb/aerion/issues/22)
+- Fixed dialog boxes blurry fonts [#23](https://github.com/hkdb/aerion/issues/23)
+- Added context menu to folder pane [#21](https://github.com/hkdb/aerion/issues/21)
+- Close conversation viewer when a message is marked as unread
+- Add right alt for triggering context menu with keyboard
+
+
 **v0.1.23 - 02-16-2026**
 ---
 

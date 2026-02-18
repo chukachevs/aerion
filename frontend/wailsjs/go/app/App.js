@@ -478,6 +478,14 @@ export function LookupWKD(arg1) {
   return window['go']['app']['App']['LookupWKD'](arg1);
 }
 
+export function MarkAllFolderMessagesAsRead(arg1) {
+  return window['go']['app']['App']['MarkAllFolderMessagesAsRead'](arg1);
+}
+
+export function MarkAllFolderMessagesAsUnread(arg1) {
+  return window['go']['app']['App']['MarkAllFolderMessagesAsUnread'](arg1);
+}
+
 export function MarkAsNotSpam(arg1) {
   return window['go']['app']['App']['MarkAsNotSpam'](arg1);
 }

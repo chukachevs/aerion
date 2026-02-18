@@ -146,8 +146,18 @@
             conversation = conversation
           }
         } else {
-          // External change - reload conversation
+          // External change on displayed conversation
           if (conversation?.messages?.some(m => data.messageIds.includes(m.id))) {
+            if (!data.isRead) {
+              // Marked as unread externally — close the conversation to prevent
+              // scheduleMarkAsRead from re-marking it read
+              if (markAsReadTimer) {
+                clearTimeout(markAsReadTimer)
+                markAsReadTimer = null
+              }
+              conversation = null
+              return
+            }
             if (threadId && folderId) {
               loadConversation(threadId, folderId)
             }
@@ -910,6 +920,20 @@
   export function openAlwaysLoadDropdown() {
     // Dispatch custom event that EmailBody components listen to
     window.dispatchEvent(new CustomEvent('open-always-load-dropdown'))
+  }
+
+  // Open context menu for the focused (or last) message
+  export function openContextMenu() {
+    const targetId = focusedMessageId ?? getLastMessageId()
+    if (!targetId) return
+    const messageEl = document.querySelector(`[data-message-id="${targetId}"]`) as HTMLElement | null
+    if (!messageEl) return
+    const rect = messageEl.getBoundingClientRect()
+    messageEl.dispatchEvent(new MouseEvent('contextmenu', {
+      bubbles: true,
+      clientX: rect.right,
+      clientY: rect.top + rect.height / 2,
+    }))
   }
 
   // Handle action completion from context menu (per-message)

@@ -63,6 +63,17 @@
   </provides>
 
   <releases>
+    <release version="0.1.24" date="2026-02-18">
+      <description>
+        <ul>
+          <li>GMail app password fix [#22](https://github.com/hkdb/aerion/issues/22)</li>
+          <li>Fixed dialog boxes blurry fonts [#23](https://github.com/hkdb/aerion/issues/23)</li>
+          <li>Added context menu to folder pane [#21](https://github.com/hkdb/aerion/issues/21)</li>
+          <li>Close conversation viewer when a message is marked as unread</li>
+          <li>Add right alt for triggering context menu with keyboard</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.23" date="2026-02-16">
       <description>
         <ul>

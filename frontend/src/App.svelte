@@ -598,12 +598,47 @@
     isResizingList = false
   }
 
+  // After a synthetic contextmenu event, bits-ui mounts the portal asynchronously.
+  // Poll until [role="menu"] appears, then focus the first menuitem.
+  function focusContextMenu() {
+    let attempts = 0
+    const tryFocus = () => {
+      const menu = document.querySelector('[role="menu"]') as HTMLElement | null
+      if (menu) {
+        const firstItem = menu.querySelector('[role="menuitem"]:not([data-disabled])') as HTMLElement | null
+        ;(firstItem || menu).focus()
+        return
+      }
+      if (attempts++ < 10) {
+        requestAnimationFrame(tryFocus)
+      }
+    }
+    requestAnimationFrame(tryFocus)
+  }
+
+  // Track Left Alt held state for Left Alt + Right Alt combo
+  let leftAltHeld = false
+
+  function handleGlobalKeyUp(e: KeyboardEvent) {
+    if (e.code === 'AltLeft') {
+      leftAltHeld = false
+    }
+  }
+
   // Global keyboard shortcut handler
   function handleGlobalKeyDown(e: KeyboardEvent) {
+    // Track Left Alt press
+    if (e.code === 'AltLeft') {
+      leftAltHeld = true
+    }
     const inInput = isInputElement(e.target)
     const focusedPane = getFocusedPane()
     const hasConversation = selectedThreadId !== null
     
+    // Don't intercept keyboard events when a context menu or dropdown is open
+    // (bits-ui portals mount [role="menu"] only while open)
+    if (document.querySelector('[role="menu"]')) return
+
     // When composer is open, only handle Escape (composer handles its own shortcuts)
     if (showComposer) {
       // Block compose/reply shortcuts that might conflict
@@ -733,6 +768,44 @@
             }
           }
           return
+      }
+      return
+    }
+
+    // Right Alt or ContextMenu key: open context menu for focused item in current pane
+    // Left Alt + Right Alt: always open folder context menu regardless of pane
+    if (e.key === 'ContextMenu' || (e.key === 'Alt' && e.code === 'AltRight')) {
+      e.preventDefault()
+
+      // Left Alt + Right Alt combo: always target the selected folder
+      if (leftAltHeld || focusedPane === 'sidebar') {
+        if (!selectedFolderId) return
+        const folderEl = document.querySelector(
+          `[data-sidebar-item="folder"][data-folder-id="${selectedFolderId}"], ` +
+          `[data-sidebar-item="unified-account"][data-folder-id="${selectedFolderId}"]`
+        ) as HTMLElement | null
+        if (!folderEl) return
+        const rect = folderEl.getBoundingClientRect()
+        folderEl.dispatchEvent(new MouseEvent('contextmenu', {
+          bubbles: true,
+          clientX: rect.right,
+          clientY: rect.top + rect.height / 2,
+        }))
+        focusContextMenu()
+        return
+      }
+
+      switch (focusedPane) {
+        case 'messageList': {
+          messageListRef?.openContextMenu()
+          focusContextMenu()
+          return
+        }
+        case 'viewer': {
+          viewerRef?.openContextMenu()
+          focusContextMenu()
+          return
+        }
       }
       return
     }
@@ -995,7 +1068,7 @@
   }
 </script>
 
-<svelte:window onmousemove={handleMouseMove} onmouseup={handleMouseUp} onkeydown={handleGlobalKeyDown} />
+<svelte:window onmousemove={handleMouseMove} onmouseup={handleMouseUp} onkeydown={handleGlobalKeyDown} onkeyup={handleGlobalKeyUp} />
 
 <div class="flex flex-col h-full w-full overflow-hidden bg-background">
   <!-- Custom Title Bar -->

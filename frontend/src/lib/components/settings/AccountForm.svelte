@@ -249,16 +249,15 @@
     }
   })
 
-  // Update authMethod when OAuth configuration is loaded (fixes race condition)
-  // This ensures that if a user selects a provider before OAuth config is loaded,
-  // the auth method will be corrected once we know OAuth is available
+  // Update authMethod when OAuth configuration finishes loading.
+  // If a user selects a provider before the async OAuth check completes,
+  // this corrects the auth method once we know OAuth is available.
+  // Does NOT depend on authMethod — otherwise clicking "App Password"
+  // gets immediately reverted back to oauth2.
   $effect(() => {
-    // Only update if we're on a new account (not editing) and using password auth
-    if (!editAccount && authMethod === 'password' && selectedProvider) {
-      // Check if OAuth is now available for this provider
-      if (canUseOAuth(selectedProvider)) {
-        authMethod = 'oauth2'
-      }
+    const _ = oauthConfigured
+    if (!editAccount && selectedProvider && canUseOAuth(selectedProvider)) {
+      authMethod = 'oauth2'
     }
   })
 
