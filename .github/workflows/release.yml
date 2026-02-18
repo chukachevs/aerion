@@ -1,6 +1,9 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       os:
@@ -41,20 +44,18 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
-    steps:
-      - name: Skip if OS not selected
-        if: github.event.inputs.os != 'all' && github.event.inputs.os != matrix.platform
-        run: |
-          echo "Skipping ${{ matrix.platform }}"
-          exit 0
-
-      - name: Build
-        run: echo "Building for ${{ matrix.platform }} ${{ matrix.arch }}"
     env:
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       MICROSOFT_CLIENT_ID: ${{ secrets.MICROSOFT_CLIENT_ID }}
+
     steps:
+      - name: Skip if OS not selected
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.os != 'all' && github.event.inputs.os != matrix.platform
+        run: |
+          echo "Skipping ${{ matrix.platform }}"
+          exit 0
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -83,47 +84,34 @@ jobs:
           cd frontend
           npm install
 
+      # ---------- LINUX ----------
       - name: Build (Linux)
         if: matrix.platform == 'linux'
         run: |
           make build-linux
 
-          # Rename binary with version tag
           if [ "${{ matrix.arch }}" = "amd64" ]; then
             mv build/bin/aerion build/bin/aerion-${{ github.ref_name }}-linux-x86_64
-          elif [ "${{ matrix.arch }}" = "arm64" ]; then
+          else
             mv build/bin/aerion build/bin/aerion-${{ github.ref_name }}-linux-aarch64
           fi
 
-          # Build OAuth credentials shim binary
-          if [ "${{ matrix.arch }}" = "amd64" ]; then
-            CGO_ENABLED=0 GOARCH=amd64 go build \
-              -ldflags "-X 'main.GoogleClientID=$GOOGLE_CLIENT_ID' -X 'main.GoogleClientSecret=$GOOGLE_CLIENT_SECRET' -X 'main.MicrosoftClientID=$MICROSOFT_CLIENT_ID'" \
-              -o build/bin/flathub-build-env-${{ github.ref_name }}-linux-x86_64 \
-              cmd/aerion-creds/main.go
-          elif [ "${{ matrix.arch }}" = "arm64" ]; then
-            CGO_ENABLED=0 GOARCH=arm64 go build \
-              -ldflags "-X 'main.GoogleClientID=$GOOGLE_CLIENT_ID' -X 'main.GoogleClientSecret=$GOOGLE_CLIENT_SECRET' -X 'main.MicrosoftClientID=$MICROSOFT_CLIENT_ID'" \
-              -o build/bin/flathub-build-env-${{ github.ref_name }}-linux-aarch64 \
-              cmd/aerion-creds/main.go
-          fi
+          CGO_ENABLED=0 GOARCH=${{ matrix.arch }} go build \
+            -ldflags "-X 'main.GoogleClientID=$GOOGLE_CLIENT_ID' -X 'main.GoogleClientSecret=$GOOGLE_CLIENT_SECRET' -X 'main.MicrosoftClientID=$MICROSOFT_CLIENT_ID'" \
+            -o build/bin/flathub-build-env-${{ github.ref_name }}-linux-${{ matrix.arch }} \
+            cmd/aerion-creds/main.go
 
-          # Create distribution tarball (complete package for manual installation)
           mkdir -p dist-package
-          cp build/bin/aerion-${{ github.ref_name }}-linux-* dist-package/aerion
+          cp build/bin/aerion-* dist-package/aerion
           cp build/linux/install.sh dist-package/
           cp build/linux/uninstall.sh dist-package/
           cp build/linux/aerion.desktop dist-package/io.github.hkdb.Aerion.desktop
           cp build/linux/aerion.png dist-package/io.github.hkdb.Aerion.png
 
-          if [ "${{ matrix.arch }}" = "amd64" ]; then
-            tar czf aerion-linux-amd64.tar.gz -C dist-package .
-          elif [ "${{ matrix.arch }}" = "arm64" ]; then
-            tar czf aerion-linux-arm64.tar.gz -C dist-package .
-          fi
-
+          tar czf aerion-linux-${{ matrix.arch }}.tar.gz -C dist-package .
           rm -rf dist-package
 
+      # ---------- macOS ----------
       - name: Build (macOS)
         if: matrix.platform == 'darwin'
         env:
@@ -134,6 +122,7 @@ jobs:
           zip -r Aerion-darwin-${{ matrix.arch }}.zip Aerion.app
           rm -rf Aerion.app
 
+      # ---------- WINDOWS ----------
       - name: Build (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -145,66 +134,54 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: aerion-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
+          name: aerion-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
-            build/bin/aerion-*
-            build/bin/Aerion-*
-            build/bin/flathub-build-env-*
+            build/bin/*
             aerion-*.tar.gz
           retention-days: 1
 
   publish:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
-    env:
-      GH_REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     permissions:
       contents: write
-    outputs:
-      release-id: ${{ steps.create-release.outputs.id }}
-    steps:
-      - uses: actions/checkout@v4
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+    steps:
       - uses: actions/download-artifact@v4
 
-      - name: Create GitHub Release
-        id: create-release
+      - name: Upload artifacts to Release
         run: |
-          TAG_NAME=${{ github.ref_name }}
-
-          # Upload all artifacts (binaries, shim binaries, tarballs)
-          gh release upload $TAG_NAME \
+          gh release upload ${{ github.ref_name }} \
             aerion-*/build/bin/* \
             aerion-*/*.tar.gz \
             --clobber
 
   update-manifest:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: publish
     runs-on: ubuntu-24.04
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget
+      - run: sudo apt-get update && sudo apt-get install -y wget
 
-      - name: Calculate hashes and update manifest
-        run: |
+      - run: |
           cd build/flatpak/flathub
           chmod +x calculate-hashes.sh
           ./calculate-hashes.sh ${{ github.ref_name }}
 
-      - name: Upload updated manifest
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: flathub-manifest
           path: build/flatpak/flathub/io.github.hkdb.Aerion.yml
           retention-days: 1
 
   build-flatpak:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: update-manifest
     strategy:
       matrix:
@@ -213,42 +190,37 @@ jobs:
             arch: x86_64
           - os: ubuntu-24.04-arm
             arch: aarch64
+
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
           name: flathub-manifest
           path: build/flatpak/flathub
 
-      - name: Install dependencies
-        run: |
+      - run: |
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
 
-      - name: Add Flathub repository
-        run: flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+      - run: flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
 
-      - name: Install Flatpak runtimes and SDK extensions
-        run: |
+      - run: |
           flatpak install -y --user flathub \
             org.gnome.Platform//49 \
             org.gnome.Sdk//49 \
             org.freedesktop.Sdk.Extension.golang//24.08 \
             org.freedesktop.Sdk.Extension.node20//24.08
 
-      - name: Clean flatpak-builder cache
-        run: |
-          rm -rf .flatpak-builder
+      - run: rm -rf .flatpak-builder
 
-      - name: Build Flatpak (like Flathub would)
-        run: |
+      - run: |
           flatpak-builder --user --force-clean --repo=repo \
             --install-deps-from=flathub \
             build-dir build/flatpak/flathub/io.github.hkdb.Aerion.yml
@@ -256,33 +228,30 @@ jobs:
           mkdir -p build/bin
           flatpak build-bundle repo build/bin/Aerion-${{ github.ref_name }}-${{ matrix.arch }}.flatpak io.github.hkdb.Aerion
 
-      - name: Upload Flatpak to release
-        run: |
+      - run: |
           gh release upload ${{ github.ref_name }} \
             build/bin/Aerion-${{ github.ref_name }}-${{ matrix.arch }}.flatpak \
             --clobber
 
   commit-manifest:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build-flatpak
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
           name: flathub-manifest
           path: build/flatpak/flathub
 
-      - name: Commit updated manifest
-        if: success()
-        run: |
+      - run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin main:main
           git checkout main
           git add build/flatpak/flathub/io.github.hkdb.Aerion.yml
-          git commit -m "${{ github.ref_name }} - Flathub submission" || echo "No changes to commit"
+          git commit -m "${{ github.ref_name }} - Flathub submission" || echo "No changes"
           git push origin main
